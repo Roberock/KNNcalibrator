@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+seaborn
+plotly
+ipywidgets
+scikit-learn
+scipy
+h5py
+# torch
