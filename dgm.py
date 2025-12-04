@@ -1,10 +1,13 @@
 import numpy as np
 
+#TODO: add different models
 
+def paraboloid_model(theta,   # parameters to be calibrated
+                     xi=0.0,  # the design variable
+                     ):
 
-def paraboloid_model(theta, xi=0.0,
-                     A=1.0, B=0.5, C=1.5):
     """Vectorized paraboloid, mild noise; supports scalar or vector xi."""
+    A, B, C = 1.0, 0.5, 1.5  # other fixed known parametes
     theta = np.atleast_2d(theta).astype(float)
     x1, x2 = theta[:, 0], theta[:, 1]
     xi = np.asarray(xi, float)
@@ -90,5 +93,7 @@ def data_generation_mechanism(case = 1,
 
         print('case must be = 1 2 or 3.....')
 
-    return (empirical_observations, # observation-design pairs
-            theta_true)  # true target
+    output = (empirical_observations, # observation-design pairs
+              theta_true)  # true target
+
+    return output

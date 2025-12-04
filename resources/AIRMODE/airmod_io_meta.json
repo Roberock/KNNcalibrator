@@ -1,0 +1,66 @@
+{
+  "input_bounds_scaled": [
+    0.2,
+    1.8
+  ],
+  "sigma_bounds": [
+    1,
+    50
+  ],
+  "sigma_prior": "log-uniform",
+  "N": 2.0E+6,
+  "batch_size": 2048,
+  "rng_seed": 42,
+  "theta_names": [
+    "theta1_front_bungee_k",
+    "theta2_rear_bungee_k",
+    "theta3_vtp_k",
+    "theta4_tail_joint_m",
+    "theta5_right_wingtip_m",
+    "theta6_left_wingtip_m",
+    "theta7_rl_wingtip_add_m",
+    "theta8_outer_wing_add_m",
+    "theta9_wf_joint_k_x",
+    "theta10_wf_joint_k_y",
+    "theta11_wf_joint_k_z"
+  ],
+  "y_names": [
+    "D1_roll",
+    "D2_pitch",
+    "D3_heave",
+    "D4_2ndEF_bend",
+    "D5_3rdEF_bend",
+    "D6_antisym_tors",
+    "D7_sym_tors",
+    "D8_vtp_bend",
+    "D9_4thEF_bend",
+    "D10_1stEF_foreaft"
+  ],
+  "mu_x": [
+    3.375,
+    14.06,
+    243.75,
+    0.375,
+    0.345,
+    0.345,
+    0.028,
+    0.028,
+    3.75E+7,
+    3.75E+7,
+    1.31E+7
+  ],
+  "mu_y": [
+    0.697,
+    1.04,
+    2.81,
+    5.57,
+    14.69,
+    29.33,
+    31.96,
+    35.07,
+    44.08,
+    47.13
+  ],
+  "source_doi": "https://doi.org/10.1016/j.ymssp.2024.111440",
+  "variance": "small"
+}
