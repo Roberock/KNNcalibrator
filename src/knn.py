@@ -1,10 +1,9 @@
 
-from calibration import *
+from src.calibration import Calibrator
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors, KernelDensity
-
 
 class KNNCalibrator(Calibrator):
     r"""
@@ -518,7 +517,7 @@ def estimate_p_theta_knn(observed_data,
     if xi_star is None:
         simulated_data_xi = [s for s in simulated_data]
     else:
-        xi_idx = np.all(np.abs(simulated_data[2] - xi_star) < a_tol, axis=1)
+        xi_idx = np.all((np.abs(simulated_data[2] - xi_star)/(np.abs(xi_star)+ 1e-10)) < a_tol, axis=1)
         simulated_data_xi = [s[xi_idx] for s in simulated_data]
 
     # Step 2: fit a kNN on the (filtered) space of y. Normalize observations
@@ -536,12 +535,6 @@ def estimate_p_theta_knn(observed_data,
     dist, knn_idx = neigh.kneighbors(scaler.transform(observed_data))
     theta_set = np.vstack([simulated_data_xi[1][idx] for idx in knn_idx])
     return theta_set
-
-
-
-
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
 
 
 class AdaptiveKNNCalibrator:
