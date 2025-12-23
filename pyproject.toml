@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackbox-uo"
+version = "0.1.0"
+description = "Black-box UQ, calibration, and DOE toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+  "numpy~=2.3.5",
+  "scipy~=1.16.3",
+  "pandas~=2.3.3",
+  "scikit-learn~=1.7.2",
+  "h5py~=3.15.1",
+]
+
+[project.optional-dependencies]
+plot = [
+  "matplotlib~=3.10.7",
+  "seaborn~=0.13.2",
+  "plotly",
+]
+notebook = [
+  "ipywidgets",
+]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

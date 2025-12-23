@@ -1,9 +1,77 @@
-
-from src.calibration import Calibrator
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from abc import ABC, abstractmethod
 import numpy as np
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors, KernelDensity
+
+
+class Calibrator(ABC):
+    """
+    Abstract base class for calibration methods.
+
+    Workflow
+    --------
+    1. setup(...)      → provide priors, simulator, or precomputed simulations
+    2. calibrate(...)  → condition on observations, produce posterior
+    3. get_posterior() → retrieve posterior representation
+    """
+
+    def __init__(self):
+        self.is_ready = False
+
+    @abstractmethod
+    def setup(self, *args, **kwargs):
+        """Define priors, simulator, or precomputed simulations."""
+        pass
+
+    @abstractmethod
+    def calibrate(self, observations: Any, resample_n: Optional[int] = None) -> Any:
+        """Condition on observed data to produce posterior samples."""
+        pass
+
+    @abstractmethod
+    def get_posterior(self) -> Any:
+        """Retrieve posterior representation (samples, chains, or density)."""
+        pass
+
+
+class MCMCCalibrator(Calibrator):
+    """  Calibration via Bayesian MCMC (e.g. Metropolis-Hastings, HMC, NUTS). """
+    def __init__(self, n_chains: int = 4,
+                 n_samples: int = 1000,
+                 burn_in: int = 200):
+        super().__init__()
+        self.n_chains = n_chains
+        self.n_samples = n_samples
+        self.burn_in = burn_in
+
+        # internal state placeholders
+        self._prior = None
+        self._likelihood = None
+        self._posterior_chain = None
+
+    def setup(self, prior=None,
+              likelihood=None,
+              model=None):
+        """  Define priors and likelihood (or simulator-based likelihood). """
+        self._prior = prior
+        self._likelihood = likelihood
+        self.is_ready = True
+        # TODO: implement sampler initialization (PyMC, NumPyro, etc.)
+
+    def calibrate(self, observations: Any, resample_n: Optional[int] = None) -> Any:
+        """  Run MCMC to sample posterior given observations.  """
+        if not self.is_ready:
+            raise RuntimeError("Call setup() before calibrate().")
+        # TODO: implement actual MCMC run
+        self._posterior_chain = None
+        return self._posterior_chain
+
+    def get_posterior(self) -> Any:
+        """Return MCMC chain or posterior samples."""
+        return self._posterior_chain
+
+
 
 class KNNCalibrator(Calibrator):
     r"""
@@ -50,9 +118,9 @@ class KNNCalibrator(Calibrator):
         self.random_state = 42
 
         # Internal state
-        self._theta_grid: Optional[np.ndarray] = None            # shared grid if evaluate_model=True, else unused
+        self._theta_grid: Optional[np.ndarray] = None  # shared grid if evaluate_model=True, else unused
         self._theta_by_xi: Dict[Tuple[float, ...], np.ndarray] = {}  # per-design θ (may be shared ref)
-        self._y_by_xi: Dict[Tuple[float, ...], np.ndarray] = {}      # per-design y
+        self._y_by_xi: Dict[Tuple[float, ...], np.ndarray] = {}  # per-design y
         self._scaler_by_xi: Dict[Tuple[float, ...], StandardScaler] = {}
         self._neigh_by_xi: Dict[Tuple[float, ...], NearestNeighbors] = {}
         self._grid_idx_by_xi: Dict[Tuple[float, ...], np.ndarray] = {}
@@ -62,7 +130,6 @@ class KNNCalibrator(Calibrator):
         self._sim_y: Optional[np.ndarray] = None
         self._sim_theta: Optional[np.ndarray] = None
         self._sim_xi: Optional[np.ndarray] = None
-
 
     # ---------- utilities ----------
     @staticmethod
@@ -168,7 +235,6 @@ class KNNCalibrator(Calibrator):
                 self._y_by_xi[key] = y_xi
                 self._scaler_by_xi[key] = sc
                 self._neigh_by_xi[key] = neigh
-
         self.is_ready = True
 
     # ---------- nearest ----------
@@ -220,11 +286,9 @@ class KNNCalibrator(Calibrator):
                   combine_params: dict | None = None):
         """
         kNN calibration with two aggregation modes:
-
         combine:
           - 'stack'     : concatenate all kNN θ; optional de-duplication
           - 'intersect' : keep θ that occur at least 'min_count' times across all neighbor hits
-
         combine_params:
           - dedup: bool (default False) — only for 'stack'
           - theta_match_tol: float (default 1e-9) — rounding quantum for row matching/dup
@@ -232,7 +296,6 @@ class KNNCalibrator(Calibrator):
                        default: max(1, ceil(0.5 * total_blocks))   # “appear in about half of the lists”
           - use_kde: bool (default False) — if True, compute KDE log-scores and normalized weights
           - kde_bandwidth: float | None — optional bandwidth for KDE (Scott’s rule if None)
-
         Returns:
           dict with keys:
             'mode'    : 'knn'
@@ -369,7 +432,6 @@ class KNNCalibrator(Calibrator):
         else:
             raise ValueError("`combine` must be 'stack' or 'intersect'.")
 
-
     def _round_rows(self, A: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
         """
         Round rows of A to multiples of `tol` and return (unique_rows, counts).
@@ -429,112 +491,12 @@ class KNNCalibrator(Calibrator):
 
         return logp, w
 
-
     # ---------- posterior ----------
     def get_posterior(self) -> Any:
         """Return the last computed posterior dict; raises if calibrate() hasn't been called."""
         if self._posterior is None:
             raise RuntimeError("No posterior available. Run calibrate() first.")
         return self._posterior
-
-
-
-
-def estimate_p_theta_knn(observed_data,
-                         simulated_data,
-                         xi_star,
-                         knn: int = 20,
-                         a_tol: float =0.05):
-    """
-    Estimate the posterior distribution p(θ) of θ using a k-Nearest Neighbors (kNN)
-    filter on a pre-computed simulation archive, conditioned on a design ξ*.
-
-    This method restricts the simulation archive to runs at (or near) the
-    target design ξ*, then fits a kNN model in output (y) space. For each
-    observed output y_obs, it retrieves the k-nearest simulated outputs and
-    returns the corresponding θ values as approximate posterior samples.
-    Args:
-        observed_data (np.ndarray):
-            Array of observed outputs y_obs (shape: n_obs × d_y).
-            Must match the dimensionality of simulated outputs.
-        simulated_data (list):
-            A list of arrays [y, θ, ξ], containing
-                - y (n × d_y): simulation output, e.g. a transformed y with only KPIs
-                - θ (n × d_theta): parameters and variables to be calibrated
-                - ξ (n × d_xi):  conditioning controllable factors, e.g., design,  parameters
-        knn (int):
-            Number of nearest neighbors to query per observed sample.
-        xi_star
-            Target design ξ* at which the posterior is estimated.
-        a_tol (float, optional):
-            Tolerance for matching simulations to ξ*. Defaults to 0.1.
-            A simulation is kept if ||xi_sim - xi_star||∞ < a_tol.
-
-    Returns:
-        np.ndarray:
-            θ samples from the posterior, stacked across all observed y.
-            Shape: (n_obs × knn, d_theta).
-
-    Raises:
-        ValueError: If filtering leaves no simulations at ξ*.
-        RuntimeError: If kNN search fails due to inconsistent dimensions.
-
-    Notes:
-        - Scaling of outputs y is performed internally via StandardScaler
-          for robustness against different KPI magnitudes.
-        - The parameter `knn` acts as a smoothing parameter: higher values
-          broaden the posterior but reduce sharpness.
-        - The choice of `a_tol` trades off strict design conditioning vs.
-          sample size. Too small → few matches; too large → weaker conditioning.
-
-    Example:
-        >>> import numpy as np
-        >>> from sklearn.preprocessing import StandardScaler
-        >>> from sklearn.neighbors import NearestNeighbors
-        >>> # Fake simulator archive
-        >>> theta_sim = np.random.uniform(-5, 5, size=(5000, 2))
-        >>> xi_sim = np.zeros((5000, 1))
-        >>> y_sim = np.sum(theta_sim**2, axis=1, keepdims=True) \
-        ...         + 0.1*np.random.randn(5000, 1)
-        >>> simulated_data = [y_sim, theta_sim, xi_sim]
-        >>> # Observed data
-        >>> theta_true = np.array([1.5, -2.0])
-        >>> y_obs = np.sum(theta_true**2) + 0.1*np.random.randn(1)
-        >>> # Estimate posterior
-        >>> theta_post = estimate_p_theta_knn(
-        ...     observed_data=np.array([[y_obs]]),
-        ...     simulated_data=simulated_data,
-        ...     knn=50,
-        ...     xi_star=0.0
-        ... )
-        >>> theta_post.shape
-        (50, 2)
-        >>> theta_post.mean(axis=0)
-        array([ 1.4, -2.1])  # close to true [1.5, -2.0]
-    """
-
-    # Step 1: Filter simulated datasets based on ξ = ξ*
-    if xi_star is None:
-        simulated_data_xi = [s for s in simulated_data]
-    else:
-        xi_idx = np.all((np.abs(simulated_data[2] - xi_star)/(np.abs(xi_star)+ 1e-10)) < a_tol, axis=1)
-        simulated_data_xi = [s[xi_idx] for s in simulated_data]
-
-    # Step 2: fit a kNN on the (filtered) space of y. Normalize observations
-    scaler = StandardScaler()
-    if np.any(np.isnan(simulated_data_xi[0])):
-        simulated_data_xi[0] = simulated_data_xi[0][~np.isnan(simulated_data_xi[0]).any(axis=1)]
-
-    scaler.fit(simulated_data_xi[0])
-    neigh = NearestNeighbors(n_neighbors=knn)
-    neigh.fit(scaler.transform(simulated_data_xi[0]))
-
-    # Step 3: retrieve the kNN for each observed y_i  ...... check if there are nan values in the observed datasets
-    if np.any(np.isnan(observed_data)):
-        observed_data = observed_data[~np.isnan(observed_data).any(axis=1)]
-    dist, knn_idx = neigh.kneighbors(scaler.transform(observed_data))
-    theta_set = np.vstack([simulated_data_xi[1][idx] for idx in knn_idx])
-    return theta_set
 
 
 class AdaptiveKNNCalibrator:
@@ -550,8 +512,13 @@ class AdaptiveKNNCalibrator:
     5. Return calibration dataset D_cal and the non-parametric posterior.
     """
 
-    def __init__(self, simulator, sample_prior,
-                 k=20, tau_factor=1.5, aug_size=50, cov_scale=0.3,
+    def __init__(self,
+                 simulator,  # simulation model
+                 sample_prior,  # starting prior sampler
+                 k=20,  # number of knn
+                 tau_factor=1.5,
+                 aug_size=50,
+                 cov_scale=0.3,
                  max_iter=3):
         self.simulator = simulator
         self.sample_prior = sample_prior
@@ -572,7 +539,7 @@ class AdaptiveKNNCalibrator:
     # ------------------------------------------------------------
     @staticmethod
     def compute_spread(X):
-        """Scalar measure of spread (mean variance across dims)."""
+        """ Scalar measure of spread (mean variance across dims)."""
         return np.mean(np.var(X, axis=0))
 
     @staticmethod
@@ -650,93 +617,101 @@ class AdaptiveKNNCalibrator:
         return D_cal
 
 
-# ----------------------------
-# Example usage
-if __name__ == "__main__":
-    import numpy as np
-    import matplotlib.pyplot as plt
 
-    # --- import your unified calibrator ---
-    # from knn import KNNCalibrator
-    # (Assuming KNNCalibrator is defined in the current file for this snippet.)
+def estimate_p_theta_knn(observed_data,
+                         simulated_data,
+                         xi_star,
+                         knn: int = 20,
+                         a_tol: float = 0.05):
+    """
+    Estimate the posterior distribution p(θ) of θ using a k-Nearest Neighbors (kNN)
+    filter on a pre-computed simulation archive, conditioned on a design ξ*.
 
-    def paraboloid_model(theta, xi=0.0, A=1.0, B=0.5, C=1.5):
-        """Vectorized paraboloid, mild noise; supports scalar or vector xi."""
-        theta = np.atleast_2d(theta).astype(float)
-        x1, x2 = theta[:, 0], theta[:, 1]
-        xi = np.asarray(xi, float)
-        if xi.ndim == 0:
-            xi = np.full(theta.shape[0], xi)
-        elif xi.ndim == 2:  # if passed as (n,1)
-            xi = xi.ravel()
-        y = A * x1**2 + B * x1 * x2 * (1.0 + xi) + C * (x2 + xi) ** 2
-        y = y + 0.2 * np.random.randn(theta.shape[0])   # small noise
-        return y.reshape(-1, 1) if theta.shape[0] > 1 else np.array([y.item()])
+    This method restricts the simulation archive to runs at (or near) the
+    target design ξ*, then fits a kNN model in output (y) space. For each
+    observed output y_obs, it retrieves the k-nearest simulated outputs and
+    returns the corresponding θ values as approximate posterior samples.
+    Args:
+        observed_data (np.ndarray):
+            Array of observed outputs y_obs (shape: n_obs × d_y).
+            Must match the dimensionality of simulated outputs.
+        simulated_data (list):
+            A list of arrays [y, θ, ξ], containing
+                - y (n × d_y): simulation output, e.g. a transformed y with only KPIs
+                - θ (n × d_theta): parameters and variables to be calibrated
+                - ξ (n × d_xi):  conditioning controllable factors, e.g., design,  parameters
+        knn (int):
+            Number of nearest neighbors to query per observed sample.
+        xi_star
+            Target design ξ* at which the posterior is estimated.
+        a_tol (float, optional):
+            Tolerance for matching simulations to ξ*. Defaults to 0.1.
+            A simulation is kept if ||xi_sim - xi_star||∞ < a_tol.
 
-    def theta_sampler(n, lb=-15, ub=15):
-        return np.random.uniform(lb, ub, size=(n, 2))
+    Returns:
+        np.ndarray:
+            θ samples from the posterior, stacked across all observed y.
+            Shape: (n_obs × knn, d_theta).
 
-    # --------------- Build observations (unknown process) ---------------
-    N_emp = 100
-    rng = np.random.default_rng(7)
-    theta_target = rng.normal(3.1, 0.3, size=(N_emp, 2))   # this is unknown in practice
-    experiment_designs = [-1.0, 0.0, 1.0, 3.0]
+    Raises:
+        ValueError: If filtering leaves no simulations at ξ*.
+        RuntimeError: If kNN search fails due to inconsistent dimensions.
 
-    observations = []
-    for xi in experiment_designs:
-        y_emp = paraboloid_model(theta=theta_target, xi=xi)  # shape (100,1) per design
-        observations.append((y_emp, xi))
+    Notes:
+        - Scaling of outputs y is performed internally via StandardScaler
+          for robustness against different KPI magnitudes.
+        - The parameter `knn` acts as a smoothing parameter: higher values
+          broaden the posterior but reduce sharpness.
+        - The choice of `a_tol` trades off strict design conditioning vs.
+          sample size. Too small → few matches; too large → weaker conditioning.
 
-    # --------------- kNN calibration multiple designs ---------------
-    # Use model+sampler so each design gets its own per-design kNN built on the SAME theta grid
-    calib_joint = KNNCalibrator(knn=100, evaluate_model=True)
-    calib_joint.setup(
-        model=paraboloid_model,
-        theta_sampler=theta_sampler,
-        xi_list=experiment_designs,
-        n_samples=100_000,
-    )
+    Example:
+        >>> import numpy as np
+        >>> from sklearn.preprocessing import StandardScaler
+        >>> from sklearn.neighbors import NearestNeighbors
+        >>> # Fake simulator archive
+        >>> theta_sim = np.random.uniform(-5, 5, size=(5000, 2))
+        >>> xi_sim = np.zeros((5000, 1))
+        >>> y_sim = np.sum(theta_sim**2, axis=1, keepdims=True) \
+        ...         + 0.1*np.random.randn(5000, 1)
+        >>> simulated_data = [y_sim, theta_sim, xi_sim]
+        >>> # Observed data
+        >>> theta_true = np.array([1.5, -2.0])
+        >>> y_obs = np.sum(theta_true**2) + 0.1*np.random.randn(1)
+        >>> # Estimate posterior
+        >>> theta_post = estimate_p_theta_knn(
+        ...     observed_data=np.array([[y_obs]]),
+        ...     simulated_data=simulated_data,
+        ...     knn=50,
+        ...     xi_star=0.0
+        ... )
+        >>> theta_post.shape
+        (50, 2)
+        >>> theta_post.mean(axis=0)
+        array([ 1.4, -2.1])  # close to true [1.5, -2.0]
+    """
 
-    #  “intersect”
-    post_joint = calib_joint.calibrate(observations=observations, combine="intersect", resample_n=5000)
-    theta_post_joint = post_joint["theta"]        # (5000, 2) resampled
-    # If you wanted grid + weights instead, call with resample_n=None and use post_joint["theta"], post_joint["weights"].
+    # Step 1: Filter simulated datasets based on ξ = ξ*
+    if xi_star is None:
+        simulated_data_xi = [s for s in simulated_data]
+    else:
+        xi_idx = np.all((np.abs(simulated_data[2] - xi_star) / (np.abs(xi_star) + 1e-10)) < a_tol, axis=1)
+        simulated_data_xi = [s[xi_idx] for s in simulated_data]
 
-    # --------------- SINGLE-DESIGN calibration at xi=0.0 ---------------
-    xi_star = 0.0
-    y_obs_many = next(y for (y, xi) in observations if np.isclose(xi, xi_star))
+    # Step 2: fit a kNN on the (filtered) space of y. Normalize observations
+    scaler = StandardScaler()
+    if np.any(np.isnan(simulated_data_xi[0])):
+        simulated_data_xi[0] = simulated_data_xi[0][~np.isnan(simulated_data_xi[0]).any(axis=1)]
 
-    calib_single = KNNCalibrator(knn=100, evaluate_model=True)
-    calib_single.setup(
-        model=paraboloid_model,
-        theta_sampler=lambda n: theta_sampler(n, -15, 15),
-        xi_list=[xi_star],
-        n_samples=100_000,
-    )
-    post_single = calib_single.calibrate([(y_obs_many, xi_star)], combine="stack")  # pooled kNN
-    theta_post_many = post_single["theta"]  # shape: (N_emp*knn, 2)
+    scaler.fit(simulated_data_xi[0])
+    neigh = NearestNeighbors(n_neighbors=knn)
+    neigh.fit(scaler.transform(simulated_data_xi[0]))
 
-    # --------------- Quick nearest() demo ---------------
-    # Take a single observed y at xi=1.0 and fetch its 10 nearest θ:
-    y_one = observations[2][0][0]  # first row at design 1.0
-    theta_knn_10 = calib_joint.nearest(y_one, xi=1.0, k=10)  # (10,2) θ neighbors
+    # Step 3: retrieve the kNN for each observed y_i  ...... check if there are nan values in the observed datasets
+    if np.any(np.isnan(observed_data)):
+        observed_data = observed_data[~np.isnan(observed_data).any(axis=1)]
+    dist, knn_idx = neigh.kneighbors(scaler.transform(observed_data))
+    theta_set = np.vstack([simulated_data_xi[1][idx] for idx in knn_idx])
+    return theta_set
 
-    # --------------- PLOTS ---------------
-    # 1) Joint posterior (resampled) vs true cloud
-    plt.figure(figsize=(6, 5))
-    plt.scatter(theta_post_joint[:, 0], theta_post_joint[:, 1],  s=6, alpha=0.25, label="Joint posterior (vote, resampled)")
-    plt.scatter(theta_target[:, 0], theta_target[:, 1],  c="r", marker="x", s=40, label=r"θ_true samples (unknown)")
-    plt.title("Unified kNN: joint combine='vote' over multiple designs")
-    plt.xlabel("θ1"); plt.ylabel("θ2"); plt.legend(); plt.grid(True)
-    plt.show()
 
-    # 2) Single-design posterior (kNN pooled) vs true cloud
-    plt.figure(figsize=(6, 5))
-    plt.scatter(theta_post_many[:, 0], theta_post_many[:, 1], s=6, alpha=0.35, label="Single-design posterior (pooled kNN)")
-    plt.scatter(theta_target[:, 0], theta_target[:, 1],  c="r", marker="x", s=40, label=r"θ_true samples (unknown)")
-    plt.title(f"Unified kNN: single-design at ξ*={xi_star}")
-    plt.xlabel("θ1"); plt.ylabel("θ2"); plt.legend(); plt.grid(True)
-    plt.show()
-
-    # 3) Show the 10 nearest θ for one observed y at xi=1.0 (sanity check)
-    print("Ten nearest θ for one observed y at ξ=1.0:\n", theta_knn_10)

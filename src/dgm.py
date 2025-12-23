@@ -1,7 +1,5 @@
 import numpy as np
 
-#TODO: add different models
-
 def paraboloid_model(theta,   # parameters to be calibrated
                      xi=0.0,  # the design variable
                      ):
@@ -22,7 +20,6 @@ def paraboloid_model(theta,   # parameters to be calibrated
 
 def theta_sampler(n, lb=-15, ub=15):
     return np.random.uniform(lb, ub, size=(n, 2))
-
 
 
 def data_generation_mechanism(case = 1,

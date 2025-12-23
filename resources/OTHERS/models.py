@@ -1,8 +1,6 @@
 import numpy as np
 
 
-
-
 def paraboloid_model(theta, xi=0.0):
     """
     Vectorized paraboloid model
