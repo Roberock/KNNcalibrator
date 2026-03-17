@@ -3,11 +3,16 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 
 
-def scatter_post(ax, theta, truth=None, title="", alpha=0.30, s=6, label="Posterior"):
+def scatter_post(ax, theta, truth=None, title="",
+                 alpha=0.30, s=6,
+                 label="Posterior", legend=True):
     ax.scatter(theta[:,0], theta[:,1], s=s, alpha=alpha, label=label)
     if truth is not None:
-        ax.scatter(truth[:,0], truth[:,1], c="r", marker="x", s=60, label="θ true cloud")
-    ax.set_title(title); ax.set_xlabel("θ1"); ax.set_ylabel("θ2"); ax.grid(True); ax.legend()
+        ax.scatter(truth[:,0], truth[:,1], c="r", marker="+", s=60, label="θ target")
+    ax.set_title(title); ax.set_xlabel("θ1"); ax.set_ylabel("θ2");
+    ax.grid(True)
+    if legend:
+        ax.legend()
 
 
 def plot_kde_2d(samples, true_theta=None, gridsize=100, ax=None):
@@ -60,3 +65,28 @@ def weighted_mixture_kde(posterior_list, weights, gridsize=100,
 
     plt.tight_layout()
     plt.show()
+
+
+from src.backward import estimate_p_theta_knn
+
+def plot_scatter_xi_list(observations_design_list, simulated_data_list, a_tol, knn, theta_true_cloud, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+
+    for idx, (observed_data, xi_star) in enumerate(observations_design_list):
+        theta_cal_knn = estimate_p_theta_knn(observed_data,
+                                             simulated_data_list,  # must be [y_sim, theta_sim, xi_sim]
+                                             xi_star,
+                                             a_tol=a_tol,
+                                             knn=knn, )
+        if idx >0:
+            scatter_post(ax, theta_cal_knn[:, :2],
+                         truth=theta_true_cloud,
+                         title="Theta from KNN backward",
+                         legend=False)
+
+        else:
+            scatter_post(ax, theta_cal_knn[:, :2],
+                         truth=theta_true_cloud,
+                         title="Theta from KNN backward",
+                         legend=True)

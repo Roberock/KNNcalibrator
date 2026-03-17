@@ -715,3 +715,282 @@ def estimate_p_theta_knn(observed_data,
     return theta_set
 
 
+
+
+def estimate_p_theta_knn_multi(
+    observed_data_list: List[np.ndarray],
+    simulated_data: List[np.ndarray],
+    xi_star_list: List[np.ndarray],
+    knn: int = 20,
+    a_tol: float = 0.05,
+    return_full_cov: bool = False,
+    combine_results: bool = False,
+) -> Dict[str, Any]:
+    """
+    Multi-experiment KNN inversion in output (response) space.
+
+    For each target design ξ* in xi_star_list and corresponding observed dataset,
+    this function:
+      1) filters the simulation archive near ξ*,
+      2) fits kNN on scaled outputs,
+      3) retrieves per-observation K nearest simulations,
+      4) returns θ-sets, indices, and spread diagnostics in output and input spaces.
+
+    Args:
+        observed_data_list:
+            List of observed arrays, one per experiment e.
+            Each array has shape (n_obs_e, d_y).
+        simulated_data:
+            [y_sim, theta_sim, xi_sim] with shapes:
+                - y_sim:    (n_sim, d_y)
+                - theta_sim:(n_sim, d_theta)
+                - xi_sim:   (n_sim, d_xi)
+        xi_star_list:
+            List of target designs ξ* (arrays of shape (d_xi,) or broadcastable).
+            Must have the same length as observed_data_list.
+        knn:
+            Number of nearest neighbors per observation (clipped to available sims).
+        a_tol:
+            Tolerance for design filtering. If all |ξ*| ≤ 1e-12 → absolute L∞,
+            else relative L∞: max|ξ-ξ*|/(|ξ*|+1e-12) ≤ a_tol.
+        return_full_cov:
+            If True, returns per-observation θ covariance matrices.
+        combine_results:
+            If True, returns a 'combined' block stacking all experiments
+            (useful for downstream batching).
+
+    Returns:
+        dict with:
+            - "per_experiment": list of length E, each a dict:
+                {
+                  "xi_star": (d_xi,),
+                  "theta_samples": (n_obs_e, knn_eff_e, d_theta),
+                  "knn_indices": (n_obs_e, knn_eff_e),              # within filtered subset
+                  "knn_indices_global": (n_obs_e, knn_eff_e),       # indices in original archive
+                  "epsilon": (n_obs_e,),                            # K-th distances (scaled space)
+                  "output_spread": {
+                      "distances": (n_obs_e, knn_eff_e),
+                      "mean_distance": (n_obs_e,),
+                      "std_distance": (n_obs_e,),
+                  },
+                  "input_spread": {
+                      "theta_mean": (n_obs_e, d_theta),
+                      "theta_std": (n_obs_e, d_theta),
+                      "theta_cov": (n_obs_e, d_theta, d_theta) or None,
+                  },
+                  "meta": {
+                      "knn_eff": int,
+                      "n_sim_filtered": int,
+                      "scaler_mean_": (d_y,),
+                      "scaler_scale_": (d_y,),
+                  },
+                }
+            - "meta": {
+                "n_experiments": E,
+                "n_sim_initial": int,
+                "n_sim_after_nan_filter": int,
+              }
+            - "combined": optional stacked views when combine_results=True:
+                {
+                  "theta_samples": (sum_e n_obs_e, max_knn_eff, d_theta) with NaN pad if needed,
+                  "experiment_index": (sum_e n_obs_e,),  # which experiment each row came from
+                  "epsilon": (sum_e n_obs_e,),
+                }
+
+    Raises:
+        ValueError / RuntimeError with informative messages on shape mismatches
+        or empty filtered sets.
+    """
+    # Unpack and basic checks
+    y_sim_all, theta_sim_all, xi_sim_all = simulated_data
+    y_sim_all = np.asarray(y_sim_all)
+    theta_sim_all = np.asarray(theta_sim_all)
+    xi_sim_all = np.asarray(xi_sim_all)
+
+    if not (y_sim_all.ndim == 2 and theta_sim_all.ndim == 2 and xi_sim_all.ndim == 2):
+        raise RuntimeError("simulated_data arrays must be 2D.")
+    n_sim0 = y_sim_all.shape[0]
+    if theta_sim_all.shape[0] != n_sim0 or xi_sim_all.shape[0] != n_sim0:
+        raise RuntimeError("All simulated_data arrays must share the same first dimension.")
+
+    if len(observed_data_list) != len(xi_star_list):
+        raise RuntimeError("observed_data_list and xi_star_list must have the same length.")
+
+    # Global NaN filtering to maintain alignment
+    sim_valid = (
+        ~np.isnan(y_sim_all).any(axis=1)
+        & ~np.isnan(theta_sim_all).any(axis=1)
+        & ~np.isnan(xi_sim_all).any(axis=1)
+    )
+    valid_idx_global = np.nonzero(sim_valid)[0]
+    y_sim = y_sim_all[sim_valid]
+    theta_sim = theta_sim_all[sim_valid]
+    xi_sim = xi_sim_all[sim_valid]
+    n_sim_valid = y_sim.shape[0]
+
+    per_exp_outputs: List[Dict[str, Any]] = []
+
+    # Iterate experiments
+    for e, (y_obs_e, xi_star_e) in enumerate(zip(observed_data_list, xi_star_list)):
+        y_obs_e = np.asarray(y_obs_e)
+        xi_star_e = np.atleast_1d(np.asarray(xi_star_e))
+
+        # Sanity checks per experiment
+        if y_obs_e.ndim != 2:
+            raise RuntimeError(f"observed_data_list[{e}] must be 2D (n_obs_e, d_y).")
+        if y_obs_e.shape[1] != y_sim.shape[1]:
+            raise RuntimeError(f"y dimension mismatch at experiment {e}: "
+                               f"observed d_y={y_obs_e.shape[1]} vs simulated d_y={y_sim.shape[1]}.")
+        if xi_star_e.size != xi_sim.shape[1]:
+            raise RuntimeError(f"xi_star_list[{e}] has incompatible dimensionality: "
+                               f"{xi_star_e.size} vs d_xi={xi_sim.shape[1]}.")
+
+        # Clean NaNs from observed rows
+        obs_valid = ~np.isnan(y_obs_e).any(axis=1)
+        y_obs_e = y_obs_e[obs_valid]
+        if y_obs_e.shape[0] == 0:
+            raise ValueError(f"Experiment {e}: no valid observed rows after NaN removal.")
+
+        # Design filtering near xi_star_e
+        if np.all(np.abs(xi_star_e) <= 1e-12):
+            d_inf = np.max(np.abs(xi_sim - xi_star_e), axis=1)
+            mask = d_inf <= a_tol
+        else:
+            d_inf_rel = np.max(np.abs(xi_sim - xi_star_e) / (np.abs(xi_star_e) + 1e-12), axis=1)
+            mask = d_inf_rel <= a_tol
+
+        if not np.any(mask):
+            raise ValueError(f"Experiment {e}: no simulations within tolerance of xi_star.")
+
+        # Extract filtered arrays and keep mapping to global indices
+        y_sim_e = y_sim[mask]
+        theta_sim_e = theta_sim[mask]
+        # local->global index mapping:
+        global_idx_e = valid_idx_global[mask]
+
+        # Standardize outputs using simulated subset of this experiment
+        scaler = StandardScaler()
+        scaler.fit(y_sim_e)
+        y_sim_e_scaled = scaler.transform(y_sim_e)
+        y_obs_e_scaled = scaler.transform(y_obs_e)
+
+        # kNN search
+        knn_eff = int(min(knn, y_sim_e_scaled.shape[0]))
+        if knn_eff < 1:
+            raise ValueError(f"Experiment {e}: knn < 1 after filtering.")
+        nbrs = NearestNeighbors(n_neighbors=knn_eff, algorithm="auto")
+        nbrs.fit(y_sim_e_scaled)
+        dist_e, knn_idx_e = nbrs.kneighbors(y_obs_e_scaled)  # (n_obs_e, knn_eff)
+
+        # Retrieve θ-sets and indices
+        theta_knn_e = theta_sim_e[knn_idx_e]                      # (n_obs_e, knn_eff, d_theta)
+        knn_idx_global_e = global_idx_e[knn_idx_e]                # same shape, indices into original archive
+
+
+        # Output-space spread (scaled)
+        epsilon_e = dist_e[:, -1]                                 # K-th distance per observation
+        mean_d_e = dist_e.mean(axis=1)
+        std_d_e = dist_e.std(axis=1, ddof=1) if knn_eff > 1 else np.zeros_like(mean_d_e)
+
+        # Input-space spread
+        theta_mean_e = theta_knn_e.mean(axis=1)
+        theta_std_e = theta_knn_e.std(axis=1, ddof=1) if knn_eff > 1 else np.zeros_like(theta_mean_e)
+
+        theta_centered = theta_knn_e - theta_mean_e[:, None, :]      # (n_obs_e, knn_eff, d_theta)
+
+        # Local covariance per observation (optional but useful)
+        theta_cov_e = None
+        if return_full_cov:
+            n_obs_e, _, d_theta = theta_knn_e.shape
+            theta_cov_e = np.empty((n_obs_e, d_theta, d_theta))
+            for i in range(n_obs_e):
+                X = theta_knn_e[i]
+                theta_cov_e[i] = np.cov(X, rowvar=False) if knn_eff > 1 else np.zeros((d_theta, d_theta))
+
+
+        # θ-space radius = K-th smallest Euclidean distance to the centroid (per observation)
+        theta_pairwise = np.linalg.norm(theta_centered, axis=2)      # (n_obs_e, knn_eff)
+        theta_eps_e = np.partition(theta_pairwise, knn_eff - 1, axis=1)[:, knn_eff - 1]
+
+
+        # Optional anisotropy: ratio of largest/smallest eigenvalue of covariance
+        # (skip if knn_eff==1)
+        anisotropy_e = None
+        if knn_eff > 1:
+            # Fast eigendecomp per obs using eigh on full cov if available; else approximate via SVD on centered block
+            if return_full_cov:
+                # use the cov we already computed
+                eigvals = np.linalg.eigvalsh(theta_cov_e)            # (n_obs_e, d_theta)
+            else:
+                # cheap fallback: compute cov on the fly for anisotropy only
+                n_obs_e, _, d_theta = theta_knn_e.shape
+                eigvals = np.empty((n_obs_e, d_theta))
+                for i in range(n_obs_e):
+                    Xc = theta_centered[i]
+                    cov_i = (Xc.T @ Xc) / max(knn_eff - 1, 1)
+                    eigvals[i] = np.linalg.eigvalsh(cov_i)
+            anisotropy_e = eigvals[:, -1] / np.maximum(eigvals[:, 0], 1e-12)
+
+
+        per_exp_outputs.append({
+            "xi_star": xi_star_e.copy(),
+            "theta_samples": theta_knn_e,
+            "knn_indices": knn_idx_e,
+            "knn_indices_global": knn_idx_global_e,
+            "epsilon": epsilon_e,
+            "output_spread": {
+                "distances": dist_e,
+                "mean_distance": mean_d_e,
+                "std_distance": std_d_e,
+            },
+            "input_spread": {
+                "theta_mean": theta_mean_e,
+                "theta_std": theta_std_e,
+                "theta_cov": theta_cov_e,     # <-- θ-space radius (diagnostic)
+                "theta_radius": theta_eps_e,  # <-- θ-space radius (diagnostic)
+                "theta_anisotropy": anisotropy_e  # <-- eigenvalue ratio (diagnostic)
+            },
+            "meta": {
+                "knn_eff": knn_eff,
+                "n_sim_filtered": y_sim_e.shape[0],
+                "scaler_mean_": scaler.mean_.copy(),
+                "scaler_scale_": scaler.scale_.copy(),
+            },
+        })
+
+
+
+
+
+    result: Dict[str, Any] = {
+        "per_experiment": per_exp_outputs,
+        "meta": {
+            "n_experiments": len(per_exp_outputs),
+            "n_sim_initial": n_sim0,
+            "n_sim_after_nan_filter": n_sim_valid,
+        },
+    }
+
+    if combine_results:
+        # Build stacked views; pad to max_knn for rectangular arrays if K varies by experiment
+        max_knn = max(pe["meta"]["knn_eff"] for pe in per_exp_outputs)
+        d_theta = per_exp_outputs[0]["theta_samples"].shape[-1]
+        stacked_theta = []
+        stacked_eps = []
+        stacked_exp_idx = []
+        for e, pe in enumerate(per_exp_outputs):
+            th = pe["theta_samples"]  # (n_obs_e, knn_e, d_theta)
+            n_obs_e, knn_e, _ = th.shape
+            if knn_e < max_knn:
+                pad = np.full((n_obs_e, max_knn - knn_e, d_theta), np.nan, dtype=th.dtype)
+                th = np.concatenate([th, pad], axis=1)
+            stacked_theta.append(th)
+            stacked_eps.append(pe["epsilon"])
+            stacked_exp_idx.append(np.full(n_obs_e, e, dtype=int))
+        result["combined"] = {
+            "theta_samples": np.concatenate(stacked_theta, axis=0),   # (sum n_obs_e, max_knn, d_theta)
+            "epsilon": np.concatenate(stacked_eps, axis=0),           # (sum n_obs_e,)
+            "experiment_index": np.concatenate(stacked_exp_idx, axis=0),
+        }
+
+    return result
