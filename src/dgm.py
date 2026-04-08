@@ -75,9 +75,9 @@ def data_generation_mechanism(case = 1,
         # CASE 3: 100 samples of theta (distributed), 4–5 different experiments
         # ---------------------------------------------------------------------
         if N_emp is None:
-            N_emp = 100
+            N_emp = 200
         theta_true = rng.normal(4.0, 0.5, size=(N_emp, 2))  # shape (100,2)
-        xi_list = np.array([-2.0, -1.0, 0.0, 2.0, 4.0])  # 5 designs
+        xi_list = np.array([-2.0, -1.0, -0.2, 1.3, 2.0, .0])  # 7 designs
 
         empirical_observations = []
         for xi in xi_list:

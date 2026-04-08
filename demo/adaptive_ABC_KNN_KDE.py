@@ -1,16 +1,15 @@
 # Adaptive KNN-KDE Inverse Problem Solver (Modular Version)
 # ========================================================
-
 import numpy as np
 import pandas as pd
 from scipy.stats import multivariate_normal
 from scipy.special import logsumexp
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from scipy.stats import uniform
 
-class AdaptiveInverseSolverDesign:
+import matplotlib.pyplot as plt
+
+class AdaptiveInverseKNNKDE:
     """
     Adaptive inverse solver for models M(theta, design) -> y.
 
@@ -46,10 +45,16 @@ class AdaptiveInverseSolverDesign:
     """
 
     def __init__(self,
-        model, Y_emp_by_design, prior, sim_db=None,  N0=700,
-        K=20,   ridge=1e-3,  seed=123,
-        knn_metric="euclidean",
-        ):
+                 model,
+                 Y_emp_by_design,
+                 prior,
+                 sim_db=None,
+                 N0=500,
+                 K=10,
+                 ridge=1e-3,
+                 seed=123,
+                 knn_metric="euclidean",
+                 ):
         """  Parameters
             ----------
             model : callable
@@ -296,28 +301,21 @@ class AdaptiveInverseSolverDesign:
             eps = np.max(distances, axis=1) + 1e-12                 # (n_emp,)
             mean_knn_dist = np.mean(distances, axis=1)              # (n_emp,)
             radius_y = np.max(distances, axis=1)                    # (n_emp,)
-
             # ----------------------------------------------------------
             # 5) Importance correction for archive particles
             log_import = self.log_prior_db[indices] - self.log_prop_db[indices]  # (n_emp, K_eff)
-
             # ----------------------------------------------------------
             # 6) Batched local response-kernel weights
             logw = -0.5 * (distances / eps[:, None]) ** 2 + log_import
             logw -= logsumexp(logw, axis=1, keepdims=True)
             W = np.exp(logw)                                        # (n_emp, K_eff)
-
             # ----------------------------------------------------------
             # 7) Batched ESS
             ess = 1.0 / np.maximum(np.sum(W ** 2, axis=1), 1e-300)  # (n_emp,)
-
             # ----------------------------------------------------------
             # 8) Batched weighted covariance in parameter space
-            # Weighted mean: (n_emp, d_x)
-            mu = np.sum(X_neighbors * W[:, :, None], axis=1)
-
-            # Centered neighbors: (n_emp, K_eff, d_x)
-            Xc = X_neighbors - mu[:, None, :]
+            mu = np.sum(X_neighbors * W[:, :, None], axis=1)  # Weighted mean: (n_emp, d_x)
+            Xc = X_neighbors - mu[:, None, :]  # Centered neighbors: (n_emp, K_eff, d_x)
 
             # Unbiased-ish denominator matching the single-model helper
             denom = np.maximum(1e-12, 1.0 - np.sum(W ** 2, axis=1))  # (n_emp,)
@@ -346,6 +344,24 @@ class AdaptiveInverseSolverDesign:
                     "eps": float(eps[i]),
                     "ess": float(ess[i]),
                 })
+
+        """ # Example - visualize 
+        import matplotlib.pyplot as plt
+
+        plt.scatter(self.X_db[:, 0], self.X_db[:, 1], 2, color='k', alpha=0.1)
+
+        for c, XI in enumerate(self.local_models):
+            if c < n_emp:
+                col = 'red'
+            elif c >= n_emp and c < 2 * n_emp:
+                col = 'blue'
+            elif c < 3 * n_emp and c >= 2 * n_emp:
+                col = 'green'
+            else:
+                col = 'purple'
+            plt.scatter(XI['Xi'][:, 0], XI['Xi'][:, 1], 15, color=col)
+        plt.show()
+        """
 
         return self.local_models
 
@@ -422,17 +438,15 @@ class AdaptiveInverseSolverDesign:
         return logsumexp(np.column_stack(parts), axis=1)
 
     def _local_models_for_design(self, design):
+        """ Returns the local KDE -KNN models for the selected design """
         return [lm for lm in self.local_models if lm["design"] == design]
 
     def evaluate_design_factor_logpdf(self, X, design):
-        """
-        Evaluate the design-specific pseudo-likelihood factor:
+        """ Evaluate the design-specific pseudo-likelihood factor:
             L_e(theta) = (1 / N_e) sum_i p_hat_i^e(theta)
-
         Methodological note:
-        This is the design-wise kernel-ABC factor. The final posterior is
-        obtained only after multiplying these factors across designs and
-        combining with pi(theta)/q(theta).
+            This is the design-wise kernel-ABC factor. The final posterior is  obtained only after multiplying these factors
+            across designs and combining with pi(theta)/q(theta).
         """
         X = np.atleast_2d(np.asarray(X, dtype=float))
         lms = self._local_models_for_design(design)
@@ -564,15 +578,11 @@ class AdaptiveInverseSolverDesign:
         spread_x = np.array([np.trace(lm["cov"]) for lm in self.local_models], dtype=float)
         ess = np.array([lm["ess"] for lm in self.local_models], dtype=float)
 
-        qrad = max(np.quantile(radii, 0.75), 1e-12)
+        qrad = max(np.quantile(radii, 0.5), 1e-12)
         qspr = max(np.quantile(spread_x, 0.75), 1e-12)
 
-        priority = (
-            radii / qrad
-            + spread_x / qspr
-            + (0.4 * self.K) / np.maximum(ess, 1e-12)
-        )
-
+        #priority = ( radii / qrad   + spread_x / qspr   + (0.4 * self.K) / np.maximum(ess, 1e-12)  )
+        priority = (    radii / qrad   )
         return pd.DataFrame({
             "local_id": [lm["local_id"] for lm in self.local_models],
             "design": [lm["design"] for lm in self.local_models],
@@ -616,7 +626,7 @@ class AdaptiveInverseSolverDesign:
 
         return logsumexp(np.column_stack(parts), axis=1)
 
-    def sample_targeted_batch( self,  flagged_local_ids,
+    def sample_targeted_batch_v0( self,  flagged_local_ids,
                                n_new=100,  inflate=1.0,
                                prior_weight=0.10):
         """
@@ -648,6 +658,8 @@ class AdaptiveInverseSolverDesign:
                 comp = self.rng.choice(len(lm["weights"]), p=lm["weights"])
                 mu = lm["Xi"][comp]
                 cov = inflate * lm["cov"]
+                # , n_sam_per_local: int =10 consider more than one sample per local
+                #  X_new[row] = self.rng.multivariate_normal(mu, cov, n_sam_per_local)
                 X_new[row] = self.rng.multivariate_normal(mu, cov)
 
         logq_new = self._proposal_logpdf(
@@ -658,6 +670,85 @@ class AdaptiveInverseSolverDesign:
             inflate=inflate,
         )
         return X_new, logq_new
+
+    def sample_targeted_batch(
+            self,
+            flagged_local_ids,
+            n_new=100,
+            inflate=1.0,
+            prior_weight=0.10,
+            n_rep_per_choice=100,
+    ):
+        """
+        Draw new theta particles from a mixture of flagged local kernels plus a
+        small prior component.
+
+        n_new is the total number of returned particles.
+        n_rep_per_choice controls how many iid Gaussian draws are taken after one
+        source choice (prior or local kernel). If > 1, the method becomes more
+        exploitative locally.
+        """
+        if n_rep_per_choice < 1:
+            raise ValueError("n_rep_per_choice must be >= 1")
+
+        flagged, mix_w = self._build_flagged_mixture(flagged_local_ids)
+
+        # Number of source choices needed to produce about n_new samples
+        n_choices = int(np.ceil(n_new / n_rep_per_choice))
+
+        source_u = self.rng.uniform(size=n_choices)
+        prior_mask = source_u < prior_weight
+
+        X_parts = []
+
+        # Prior draws
+        n_prior_choices = int(prior_mask.sum())
+        if n_prior_choices > 0:
+            Xp = self._prior_rvs(n_prior_choices * n_rep_per_choice)
+            X_parts.append(Xp)
+
+        # Local draws
+        n_local_choices = n_choices - n_prior_choices
+        if n_local_choices > 0:
+            chosen_flag = self.rng.choice(len(flagged), size=n_local_choices, p=mix_w)
+
+            for j in chosen_flag:
+                lm = flagged[int(j)]
+                comp = self.rng.choice(len(lm["weights"]), p=lm["weights"])
+                mu = lm["Xi"][comp]
+                cov = inflate * lm["cov"]
+
+                X_loc = self.rng.multivariate_normal(
+                    mean=mu,
+                    cov=cov,
+                    size=n_rep_per_choice,
+                )
+                X_parts.append(np.atleast_2d(X_loc))
+
+        if len(X_parts) == 0:
+            X_new = np.empty((0, self.d_x), dtype=float)
+            logq_new = np.empty((0,), dtype=float)
+            return X_new, logq_new
+
+        X_new = np.vstack(X_parts)
+
+        # Trim to exactly n_new samples
+        if X_new.shape[0] > n_new:
+            X_new = X_new[:n_new]
+
+        logq_new = self._proposal_logpdf(
+            X_new,
+            flagged=flagged,
+            mix_w=mix_w,
+            prior_weight=prior_weight,
+            inflate=inflate,
+        )
+        return X_new, logq_new
+
+
+
+
+
 
     def append_to_archive(self, X_new, logq_new):
         """
@@ -681,13 +772,19 @@ class AdaptiveInverseSolverDesign:
         for d in self.designs:
             self.Y_db_by_design[d] = np.vstack([self.Y_db_by_design[d], Y_new_by_design[d]])
 
-    def adaptive_refine(
-        self,   max_iter=10,    top_frac=0.30,
-        n_new_per_iter=100,   inflate=1.0,
-        prior_weight=0.10,   improve_tol=0.05,
-        patience=3,   target_shrink=0.60,    min_iter=2,  ):
-        """  Run the adaptive loop.
+    def adaptive_refine(self,
+                        max_iter=10,
+                        top_frac=0.30,
+                        n_new_per_iter=100,
+                        inflate=1.0,
+                        prior_weight=0.10,
+                        improve_tol=0.05,
+                        patience=3,
+                        target_shrink=0.60,
+                        min_iter=2,
+                        true_target=None):
 
+        """  Run the adaptive loop.
             Stopping logic is based on:
             - reduction in mean and max response-space radii
             - stagnation in these diagnostics
@@ -709,33 +806,32 @@ class AdaptiveInverseSolverDesign:
             max_radius = float(diag["radius_y"].max())
             mode_x, mode_w = self.posterior_mode_from_db()
 
+            """
+            plt.scatter(true_target[:,0],true_target[:,1])
+            plt.scatter(self.X_db[self.post_weights_db>1e-4,0],self.X_db[self.post_weights_db>1e-4,1]) 
+            plt.scatter(self.X_db[self.post_weights_db>0.001,0],self.X_db[self.post_weights_db>0.001,1]) 
+            plt.scatter(self.X_db[self.post_weights_db>0.02,0],self.X_db[self.post_weights_db>0.02,1]) 
+            plt.show()
+            """
+
             if it == 0:
                 base_mean_radius = mean_radius
                 base_max_radius = max_radius
 
-            rel_impr = (
-                np.nan
-                if prev_mean_radius is None
-                else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)
-            )
-            mode_shift = (
-                np.nan
-                if prev_mode is None
-                else float(np.linalg.norm(mode_x - prev_mode))
-            )
+            rel_impr = (  np.nan  if prev_mean_radius is None
+                          else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)  )
+            mode_shift = (  np.nan if prev_mode is None
+                            else float(np.linalg.norm(mode_x - prev_mode))             )
 
             n_flagged = max(1, int(np.ceil(top_frac * len(diag))))
             flagged_local_ids = diag["local_id"].iloc[:n_flagged].to_numpy()
 
-            reached_target = (
-                (mean_radius <= target_shrink * base_mean_radius) and
-                (max_radius <= target_shrink * base_max_radius)
-            )
-            stalled = (
-                prev_mean_radius is not None and
-                rel_impr < improve_tol and
-                (np.isnan(mode_shift) or mode_shift < 1e-6)
-            )
+            reached_target = ( (mean_radius <= target_shrink * base_mean_radius) and
+                               (max_radius <= target_shrink * base_max_radius) )
+            stalled = ( prev_mean_radius is not None and
+                        rel_impr < improve_tol and
+                        (np.isnan(mode_shift) or mode_shift < 1e-6) )
+
             stagnant_rounds = stagnant_rounds + 1 if stalled else 0
 
             stop = False
@@ -758,6 +854,7 @@ class AdaptiveInverseSolverDesign:
                 "mode_shift": float(mode_shift) if not np.isnan(mode_shift) else np.nan,
                 "stop": bool(stop),
                 "stop_reason": reason,
+                "Xi_best95": self.X_db[self.post_weights_db > np.quantile(self.post_weights_db,0.95), :],
             })
 
             print(
@@ -776,6 +873,9 @@ class AdaptiveInverseSolverDesign:
                 inflate=inflate,
                 prior_weight=prior_weight,
             )
+
+            # try sample_from_worst_ball
+
             self.append_to_archive(X_new, logq_new)
 
             prev_mean_radius = mean_radius
@@ -813,6 +913,54 @@ class AdaptiveInverseSolverDesign:
         out["post_weight"] = self.post_weights_db
         return out
 
+    def sample_from_worst_ball(
+            self,
+            n_per_center=5,
+            inflate=1.0,
+            kernel="gaussian",
+            use_radius_only=True,
+    ):
+        """
+        Simpler refinement:
+        1) pick the empirical response with the largest KNN ball
+        2) take its K reconstructed input neighbours
+        3) sample around each of those K input points
+        """
+        self.fit_local_models()
+
+        diag = self.diagnostics().copy()
+        sort_col = "radius_y" if use_radius_only else "priority"
+        diag = diag.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+        worst_local_id = int(diag.iloc[0]["local_id"])
+        lm = self.local_models[worst_local_id]
+
+        centers = lm["Xi"]  # shape (K, d_x)
+        cov = inflate * lm["cov"]
+
+        X_new_parts = []
+
+        if kernel == "gaussian":
+            for mu in centers:
+                X_new_parts.append(
+                    self.rng.multivariate_normal(mu, cov, size=n_per_center)
+                )
+
+        elif kernel == "uniform_box":
+            std = np.sqrt(np.diag(cov))
+            for mu in centers:
+                U = self.rng.uniform(
+                    low=mu - std,
+                    high=mu + std,
+                    size=(n_per_center, self.d_x),
+                )
+                X_new_parts.append(U)
+
+        else:
+            raise ValueError("kernel must be 'gaussian' or 'uniform_box'")
+
+        X_new = np.vstack(X_new_parts)
+        return X_new, worst_local_id, lm
 
 class UniformBoxPrior:
     """
@@ -851,105 +999,54 @@ class UniformBoxPrior:
         return rng.uniform(self.low, self.high, size=(size, self.d_x))
 
 
+
 if __name__ == '__main__':
-
     print("=== DEMO: Posterior Progression Towards True Target ===")
-
     # --------------------------------------------------------------
     # Forward model with explicit design argument
-    def demo_model(X, design):
-        """
-        X: shape (n, 2)
-        design: scalar or small dict controlling the response map
-        """
-        X = np.atleast_2d(X)
-        d_y = 40
-
-        # Example: let the design slightly modify the response geometry
-        design = float(design)
-        a = np.linspace(0.7, 2.4, d_y) * (1.0 + 0.10 * design)
-        b = np.linspace(1.1, 3.2, d_y) * (1.0 - 0.05 * design)
-        c = np.linspace(0.5, 1.7, d_y) * (1.0 + 0.08 * design)
-
-        x1, x2 = X[:, 0:1], X[:, 1:2]
-
-        Y = (
-            np.sin(x1 * a)
-            + 0.6 * np.cos(x2 * b)
-            + 0.15 * (x1**2 + x2**2)
-            + 0.1 * np.sin((x1 - x2) * c)
-        )
-        return Y
+    from resources.loader_usecases import prepare_case
+    demo_model, _, _ = prepare_case(1, Nemp=10, Nsim=1000)
 
     # --------------------------------------------------------------
     # Synthetic "true posterior" used only to generate empirical data
-    # --------------------------------------------------------------
     rng = np.random.default_rng(123)
     m = 100
-
     weights = np.array([0.55, 0.45])
-    mus_true = np.array([
-        [-0.5,  1.0],
-        [ 0.2, -1.0]
-    ])
-    covs_true = np.array([
-        [[ 0.15,  0.05], [ 0.05,  0.20]],
-        [[ 0.20, -0.03], [-0.03,  0.10]]
-    ])
-
+    mus_true = np.array([[-0.5,  1.0],   [ 0.2, -1.0]])
+    covs_true = np.array([[[ 0.15,  0.05], [ 0.05,  0.20]], [[ 0.20, -0.03], [-0.03,  0.10]] ])
     z = rng.choice(2, size=m, p=weights)
     X_latent = np.zeros((m, 2))
     for k in range(2):
         idx = (z == k)
-        X_latent[idx] = rng.multivariate_normal(
-            mus_true[k], covs_true[k], size=idx.sum()
-        )
-
+        X_latent[idx] = rng.multivariate_normal(mus_true[k], covs_true[k], size=idx.sum())
     # --------------------------------------------------------------
     # One or more experimental designs
-    # --------------------------------------------------------------
-    designs = [0.0, 1.0]
-
-    # Empirical responses grouped by design
-    Y_emp_by_design = {
-        d: demo_model(X_latent, d) for d in designs
-    }
+    designs = [-1.0, 2.0, 4.0]
+    Y_emp_by_design = { xi: demo_model(X_latent, xi) for xi in designs }
 
     # --------------------------------------------------------------
-    # Prior on theta
-    # --------------------------------------------------------------
-    # prior = UniformBoxPrior(low=[-4, -4], high=[4, 4])
-    prior = multivariate_normal(mean=[0, 0], cov=[[2.5, 0], [0, 2.5]])
-
-    # Ground-truth target density in parameter space, for comparison only
-    true_posterior = lambda X: (
-        weights[0] * multivariate_normal(mus_true[0], covs_true[0]).pdf(X)
-        + weights[1] * multivariate_normal(mus_true[1], covs_true[1]).pdf(X)
-    )
+    prior = UniformBoxPrior(low=[-15,-15], high=[15,15])
 
     # --------------------------------------------------------------
     # Instantiate the NEW solver
-    # --------------------------------------------------------------
-    solver = AdaptiveInverseSolverDesign(
-        model=demo_model,
-        Y_emp_by_design=Y_emp_by_design,
-        prior=prior,
-        N0=700,
-        K=50,
-        ridge=1e-3,
-        seed=123,
-    )
+    solver = AdaptiveInverseKNNKDE(   model=demo_model,
+                                            Y_emp_by_design=Y_emp_by_design,
+                                            prior=prior,
+                                            N0=700,
+                                            K=50,
+                                            ridge=1e-3,
+                                            seed=123,
+                                            )
 
     print("Initial archive summary:", solver.archive_summary())
 
     # --------------------------------------------------------------
     # Adaptive refinement
-    # --------------------------------------------------------------
     n_new_per_iter = 100
     top_frac = 0.2
 
     hist, diag = solver.adaptive_refine(
-        max_iter=10,
+        max_iter=15,
         top_frac=top_frac,
         n_new_per_iter=n_new_per_iter,
         inflate=1.0,
@@ -957,7 +1054,7 @@ if __name__ == '__main__':
         improve_tol=0.05,
         patience=3,
         target_shrink=0.60,
-        min_iter=2,
+        min_iter=5,
     )
 
     print("\n=== Refinement history ===")
