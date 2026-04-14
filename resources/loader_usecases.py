@@ -23,13 +23,14 @@ def prepare_case(case_id, Nemp=20, Nsim=1_000):
 
 def prepare_case_1_data(Nemp=20, Nsim=1_000, seed=123):
     """loading model M, empirical data Demp, and simulated archived Dsim for case 1 """
+
     rng = np.random.default_rng(seed)
+
     def paraboloid_model(theta, xi=0.0):
         A, B, C = 1.0, 0.5, 1.5
         x1, x2 = theta[:, 0], theta[:, 1]
         xi = np.asarray(xi, dtype=float)
         return A * x1**2 + B * x1 * x2 * (1.0 + xi) + C * (x2 + xi) ** 2
-
 
     def sample_true_pdf_theta(Nemp):
         # Sample from multivariate Gaussian:

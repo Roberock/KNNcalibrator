@@ -60,7 +60,10 @@ def data_generation_mechanism(case = 1,
         # ---------------------------------------------------------------------
         if N_emp is None:
             N_emp = 100
-        theta_true = rng.normal(4.0, 0.5, size=(N_emp, 2))  # shape (100,2)
+
+        mean_vec = [2.0, 3.0]
+        cov_mat = [[0.5, 0.0], [0.0, 0.5]]
+        theta_true = rng.multivariate_normal(mean_vec, cov_mat, size=N_emp)
         xi_list = np.array([0.0])
 
         empirical_observations = []
@@ -75,9 +78,11 @@ def data_generation_mechanism(case = 1,
         # CASE 3: 100 samples of theta (distributed), 4–5 different experiments
         # ---------------------------------------------------------------------
         if N_emp is None:
-            N_emp = 200
-        theta_true = rng.normal(4.0, 0.5, size=(N_emp, 2))  # shape (100,2)
-        xi_list = np.array([-2.0, -1.0, -0.2, 1.3, 2.0, .0])  # 7 designs
+            N_emp = 100
+        mean_vec = [2.0, 3.0]
+        cov_mat = [[0.5, 0.0], [0.0, 0.5]]
+        theta_true = rng.multivariate_normal(mean_vec, cov_mat, size=N_emp)
+        xi_list = np.array([-2.0, -1.0, -0.2, 1.3, 2.0, .0])  # ... designs
 
         empirical_observations = []
         for xi in xi_list:

@@ -6,6 +6,7 @@ from scipy.stats import multivariate_normal
 from scipy.special import logsumexp
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from demo.helpers_ISRERM2026 import sliced_wasserstein_2
 
 import matplotlib.pyplot as plt
 
@@ -170,9 +171,7 @@ class AdaptiveInverseKNNKDE:
         raise ValueError("Prior must provide rvs() or mean/cov.")
 
     def _simulate_all_designs(self, X):
-        """
-        Simulate all designs for the same shared particles X.
-        """
+        """ Simulate all designs for the same shared particles X. """
         X = np.asarray(X, dtype=float)
         Y_by_design = {}
         for design in self.designs:
@@ -181,10 +180,8 @@ class AdaptiveInverseKNNKDE:
 
     def _initialize_prior_db(self, N0=1000):
         """ Initial archive: draw theta from the prior, then simulate all designs.
-
         Methodological note:  This is the correct archive structure for later multiplicative
-        aggregation across designs, because every row corresponds to the same  theta_k evaluated under all designs.
-        """
+        aggregation across designs, because every row corresponds to the same  theta_k evaluated under all designs."""
         X = self._prior_rvs(N0)
         Y_by_design = self._simulate_all_designs(X)
         logp = np.asarray(self.prior.logpdf(X), dtype=float)
@@ -237,9 +234,7 @@ class AdaptiveInverseKNNKDE:
 
     @staticmethod
     def _safe_mvn_logpdf(X, mean, cov):
-        """
-        Small wrapper to tolerate near-singular local covariances.
-        """
+        """ Small wrapper to tolerate near-singular local covariances. """
         return multivariate_normal(mean=mean, cov=cov, allow_singular=True).logpdf(X)
 
     # ------------------------------------------------------------------
@@ -562,7 +557,7 @@ class AdaptiveInverseKNNKDE:
 
     # ------------------------------------------------------------------
     # Diagnostics
-    def diagnostics(self):
+    def diagnostics0(self):
         """  Local diagnostics used to decide where enrichment is needed.
             Priority combines:
             - large response-space radius
@@ -578,11 +573,30 @@ class AdaptiveInverseKNNKDE:
         spread_x = np.array([np.trace(lm["cov"]) for lm in self.local_models], dtype=float)
         ess = np.array([lm["ess"] for lm in self.local_models], dtype=float)
 
-        qrad = max(np.quantile(radii, 0.5), 1e-12)
-        qspr = max(np.quantile(spread_x, 0.75), 1e-12)
+        r_med = max(np.median(radii), 1e-12)
+        s_med = max(np.median(spread_x), 1e-12)
+        u = self.K / np.maximum(ess, 1.0)
+        u_med = max(np.median(u), 1e-12)
 
-        #priority = ( radii / qrad   + spread_x / qspr   + (0.4 * self.K) / np.maximum(ess, 1e-12)  )
+        qrad = max(np.quantile(radii, 0.5), 1e-12)
+        # qspr = max(np.quantile(spread_x, 0.75), 1e-12)
+
+        # priority = ( radii / qrad   + spread_x / qspr   + (0.4 * self.K) / np.maximum(ess, 1e-12)  )
         priority = (    radii / qrad   )
+
+
+        # local posterior mass carried by neighbors
+        """mass = np.array([
+            np.sum(self.post_weights_db[lm["indices"]]) if self.post_weights_db is not None else 1.0
+            for lm in self.local_models
+        ], dtype=float)
+
+        priority = (mass + 1e-12) ** 0.5 * (
+                0.45 * (radii / r_med) +
+                0.30 * (spread_x / s_med) +
+                0.25 * (u / u_med)
+        )"""
+
         return pd.DataFrame({
             "local_id": [lm["local_id"] for lm in self.local_models],
             "design": [lm["design"] for lm in self.local_models],
@@ -595,6 +609,57 @@ class AdaptiveInverseKNNKDE:
             "priority": priority,
         })
 
+    def diagnostics(self):
+        """
+        Local diagnostics used for adaptive refinement.
+
+        Revised priority:
+          - response-space radius
+          - theta-space spread
+          - low local ESS
+          - local posterior mass carried by the corresponding archive neighbors
+
+        The mass term prevents spending simulations on diffuse but irrelevant regions.
+        """
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        radii = np.array([lm["radius_y"] for lm in self.local_models], dtype=float)
+        spread_x = np.array([np.trace(lm["cov"]) for lm in self.local_models], dtype=float)
+        ess = np.array([lm["ess"] for lm in self.local_models], dtype=float)
+
+        # local posterior mass carried by the archive particles in each local kernel
+        mass = np.array([
+            np.sum(self.post_weights_db[lm["indices"]]) for lm in self.local_models
+        ], dtype=float)
+
+        # robust normalizers
+        r_med = max(np.median(radii), 1e-12)
+        s_med = max(np.median(spread_x), 1e-12)
+        u = self.K / np.maximum(ess, 1.0)
+        u_med = max(np.median(u), 1e-12)
+
+        # revised composite priority
+        priority = (mass + 1e-12) ** 0.5 * (
+                0.45 * (radii / r_med) +
+                0.30 * (spread_x / s_med) +
+                0.25 * (u / u_med)
+        )
+
+        return pd.DataFrame({
+            "local_id": [lm["local_id"] for lm in self.local_models],
+            "design": [lm["design"] for lm in self.local_models],
+            "empirical_id": [lm["empirical_id"] for lm in self.local_models],
+            "radius_y": radii,
+            "mean_knn_dist": [lm["mean_knn_dist"] for lm in self.local_models],
+            "eps": [lm["eps"] for lm in self.local_models],
+            "spread_x_trace": spread_x,
+            "ess": ess,
+            "mass": mass,
+            "priority": priority,
+        })
     # ------------------------------------------------------------------
     # Adaptive enrichment
     def _build_flagged_mixture(self, flagged_local_ids):
@@ -626,9 +691,696 @@ class AdaptiveInverseKNNKDE:
 
         return logsumexp(np.column_stack(parts), axis=1)
 
+    def sample_from_posterior_kde(self, n_samples=1000, smooth=True):
+        """ Sample from a continuous posterior KDE approximation.
+        If smooth=False:  Uses a global Gaussian KDE:
+                p_hat(theta|D) ≈ sum_k w_k N(theta ; X_db[k], Sigma_global)
+        If smooth=True:  Uses a locally smoothed Gaussian mixture:
+                p_hat(theta|D) ≈ sum_k w_k N(theta ; X_db[k], Sigma_k)
+        Returns -->   X_new : ndarray, shape (n_samples, d_x)  """
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        n = self.X_db.shape[0]
+        idx = self.rng.choice(n, size=int(n_samples), replace=True, p=self.post_weights_db)
+
+        # ----------------------------------------------------------
+        # Global KDE: same covariance for all particles
+        if not smooth or len(self.local_models) == 0:
+            cov = self._weighted_cov(self.X_db, self.post_weights_db, self.ridge)
+            X_new = np.zeros((n_samples, self.d_x), dtype=float)
+            for i, j in enumerate(idx):
+                X_new[i] = self.rng.multivariate_normal(self.X_db[j], cov)
+            return X_new
+
+        # ----------------------------------------------------------
+        # Local KDE: covariance attached to each archive particle
+        covs_per_idx = [[] for _ in range(n)]
+        for lm in self.local_models:
+            for j in lm["indices"]:
+                covs_per_idx[int(j)].append(lm["cov"])
+
+        global_cov = self._weighted_cov(self.X_db, self.post_weights_db, self.ridge)
+
+        cov_list = []
+        for j in range(n):
+            if len(covs_per_idx[j]) == 0:
+                cov_list.append(global_cov)
+            else:
+                cov_list.append(np.mean(covs_per_idx[j], axis=0) + self.ridge * np.eye(self.d_x))
+
+        X_new = np.zeros((n_samples, self.d_x), dtype=float)
+        for i, j in enumerate(idx):
+            X_new[i] = self.rng.multivariate_normal(self.X_db[j], cov_list[j])
+
+        return X_new
+
+    def _tempered_post_weights(self, temp=0.7):
+        """
+        Tempered posterior weights on the archive:
+            w_tilde_k ∝ (w_k)^temp
+        with temp in (0,1] for flattening / more exploration.
+        """
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        w = np.asarray(self.post_weights_db, dtype=float)
+        w = np.maximum(w, 1e-300)
+        w = w ** float(temp)
+        w /= np.sum(w)
+        return w
+
+    def _posterior_kde_cov(self, cov_scale=1.0):
+        """
+        Global KDE covariance built from the weighted archive posterior.
+        """
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        cov = self._weighted_cov(self.X_db, self.post_weights_db, self.ridge)
+        return float(cov_scale) * cov
+
+    def _posterior_kde_logpdf(self, X, temp=0.7, cov_scale=1.0):
+        """
+        Continuous KDE approximation of the archive posterior:
+            q_post(theta) = sum_k w_tilde_k N(theta ; X_db[k], Sigma_global)
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        w = self._tempered_post_weights(temp=temp)
+        cov = self._posterior_kde_cov(cov_scale=cov_scale)
+
+        parts = []
+        for wk, mu in zip(w, self.X_db):
+            parts.append(np.log(wk + 1e-300) + self._safe_mvn_logpdf(X, mu, cov))
+        return logsumexp(np.column_stack(parts), axis=1)
+
+    def _sample_from_tempered_posterior_kde(self, n_new=100, temp=0.7, cov_scale=1.0):
+        """
+        Draw from the continuous KDE approximation of the current posterior.
+        """
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        w = self._tempered_post_weights(temp=temp)
+        cov = self._posterior_kde_cov(cov_scale=cov_scale)
+
+        idx = self.rng.choice(self.X_db.shape[0], size=int(n_new), replace=True, p=w)
+        X_new = np.zeros((int(n_new), self.d_x), dtype=float)
+        for i, j in enumerate(idx):
+            X_new[i] = self.rng.multivariate_normal(mean=self.X_db[j], cov=cov)
+
+        logq = self._posterior_kde_logpdf(X_new, temp=temp, cov_scale=cov_scale)
+        return X_new, logq
+
+    def _local_centers(self):
+        """
+        Weighted local means in theta-space for each local model.
+        """
+        centers = []
+        for lm in self.local_models:
+            mu = np.sum(lm["Xi"] * lm["weights"][:, None], axis=0)
+            centers.append(mu)
+        return np.asarray(centers, dtype=float)
+
+    def _select_diverse_flagged(self, diag, n_select=3, sep_scale=0.5):
+        """
+        Greedy diversity filter on flagged local models in theta-space.
+        Prevents refining repeatedly on the same ridge / branch.
+
+        Parameters
+        ----------
+        diag : DataFrame
+            Must already be sorted descending by priority.
+        n_select : int
+            Number of flagged locals to retain.
+        sep_scale : float
+            Separation threshold as a fraction of the median local scale.
+        """
+        if len(diag) == 0:
+            return np.array([], dtype=int)
+
+        centers = self._local_centers()
+        local_ids = diag["local_id"].to_numpy(dtype=int)
+
+        # local scale based on average posterior spread
+        local_scales = np.array([
+            np.sqrt(max(np.trace(lm["cov"]), 1e-12)) for lm in self.local_models
+        ], dtype=float)
+        sep = float(sep_scale) * np.median(local_scales)
+
+        chosen = []
+        chosen_centers = []
+
+        for lid in local_ids:
+            c = centers[lid]
+            if len(chosen_centers) == 0:
+                chosen.append(lid)
+                chosen_centers.append(c)
+            else:
+                dmin = np.min([np.linalg.norm(c - cc) for cc in chosen_centers])
+                if dmin >= sep:
+                    chosen.append(lid)
+                    chosen_centers.append(c)
+
+            if len(chosen) >= n_select:
+                break
+
+        # if diversity filter was too strict, fill from top priority
+        if len(chosen) < n_select:
+            for lid in local_ids:
+                if lid not in chosen:
+                    chosen.append(int(lid))
+                if len(chosen) >= n_select:
+                    break
+
+        return np.asarray(chosen, dtype=int)
+
+    def _posterior_predictive_score(self, n_post=1000, use_kde=False, temp=0.7):
+        """
+        Observable predictive discrepancy:
+            compare posterior predictive responses to empirical responses in Y-space.
+
+        Returns
+        -------
+        score : float
+            Average sqrt(sliced_wasserstein_2) across designs.
+            Smaller is better.
+        """
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        if use_kde:
+            X_post, _ = self._sample_from_tempered_posterior_kde(
+                n_new=n_post,
+                temp=temp,
+                cov_scale=1.0
+            )
+        else:
+            X_post = self.posterior_particles(n_samples=n_post, replace=True)
+
+        vals = []
+        for design in self.designs:
+            Y_pred = self._ensure_2d(self.model(X_post, design))
+            Y_emp = self.Y_emp_by_design[design]
+            vals.append(np.sqrt(sliced_wasserstein_2(
+                np.asarray(Y_emp, dtype=float),
+                np.asarray(Y_pred, dtype=float),
+                n_proj=100
+            )))
+        return float(np.mean(vals))
+
+
+    def append_to_archive(self, X_new, logq_new):
+        """
+        Append new shared particles and simulate them under all designs.
+        """
+        X_new = np.asarray(X_new, dtype=float)
+        logq_new = np.asarray(logq_new, dtype=float)
+
+        if X_new.ndim != 2 or X_new.shape[1] != self.d_x:
+            raise ValueError("X_new has wrong shape.")
+        if logq_new.shape[0] != X_new.shape[0]:
+            raise ValueError("logq_new length does not match X_new.")
+
+        Y_new_by_design = self._simulate_all_designs(X_new)
+        logp_new = np.asarray(self.prior.logpdf(X_new), dtype=float)
+
+        self.X_db = np.vstack([self.X_db, X_new])
+        self.log_prior_db = np.concatenate([self.log_prior_db, logp_new])
+        self.log_prop_db = np.concatenate([self.log_prop_db, logq_new])
+
+        for d in self.designs:
+            self.Y_db_by_design[d] = np.vstack([self.Y_db_by_design[d], Y_new_by_design[d]])
+
+    def adaptive_refine_v0(self,
+                        max_iter=10,
+                        top_frac=0.30,
+                        n_new_per_iter=100,
+                        inflate=1.0,
+                        prior_weight=0.10,
+                        improve_tol=0.05,
+                        patience=3,
+                        target_shrink=0.60,
+                        min_iter=2,
+                        true_target=None):
+
+        """  Run the adaptive loop.
+            Stopping logic is based on:
+            - reduction in mean and max response-space radii
+            - stagnation in these diagnostics
+        """
+        self.history = []
+        stagnant_rounds = 0
+
+        base_mean_radius = None
+        base_max_radius = None
+        prev_mean_radius = None
+        prev_mode = None
+
+        for it in range(max_iter):
+            # Refit local models and posterior on current archive
+            self.fit_local_models()
+            self.compute_log_posterior_weights_on_archive()
+            diag = self.diagnostics().sort_values("priority", ascending=False).reset_index(drop=True)
+            mean_radius = float(diag["radius_y"].mean())
+            max_radius = float(diag["radius_y"].max())
+            mode_x, mode_w = self.posterior_mode_from_db()
+
+            if it == 0:
+                base_mean_radius = mean_radius
+                base_max_radius = max_radius
+
+            rel_impr = (  np.nan  if prev_mean_radius is None
+                          else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)  )
+            mode_shift = (  np.nan if prev_mode is None
+                            else float(np.linalg.norm(mode_x - prev_mode))             )
+
+            n_flagged = max(1, int(np.ceil(top_frac * len(diag))))
+            flagged_local_ids = diag["local_id"].iloc[:n_flagged].to_numpy()
+
+            reached_target = ( (mean_radius <= target_shrink * base_mean_radius) and
+                               (max_radius <= target_shrink * base_max_radius) )
+            stalled = ( prev_mean_radius is not None and
+                        rel_impr < improve_tol and
+                        (np.isnan(mode_shift) or mode_shift < 1e-6) )
+
+            stagnant_rounds = stagnant_rounds + 1 if stalled else 0
+            stop = False
+            reason = "continue"
+            if it + 1 >= min_iter and reached_target:
+                stop, reason = True, "radius target reached"
+            elif it + 1 >= min_iter and stagnant_rounds >= patience:
+                stop, reason = True, "stagnation"
+            elif it == max_iter - 1:
+                stop, reason = True, "max_iter"
+
+            if true_target is not None:
+                Xi_posterior = self.sample_from_posterior_kde(n_samples=10_000, smooth=True)
+                Wasser_Distance = np.sqrt(sliced_wasserstein_2(np.asarray(true_target, dtype=float), Xi_posterior, n_proj=200))
+                plt.scatter(true_target[:, 0], true_target[:, 1], 1, alpha=0.1)
+                plt.scatter(Xi_posterior[:, 0], Xi_posterior[:, 1], alpha=0.1)
+                plt.show()
+            else:
+                Wasser_Distance = None
+                """
+                plt.scatter(true_target[:,0],true_target[:,1], 1,  alpha =0.1)
+                plt.scatter(self.X_db[self.post_weights_db>1e-4,0],self.X_db[self.post_weights_db>1e-4,1]) 
+                plt.scatter(self.X_db[self.post_weights_db>0.001,0],self.X_db[self.post_weights_db>0.001,1]) 
+                plt.scatter(self.X_db[self.post_weights_db>0.02,0],self.X_db[self.post_weights_db>0.02,1]) 
+                plt.show()
+                
+                Xi_posterior = self.sample_from_posterior_kde(n_samples=10_000, smooth=False)
+                plt.scatter(true_target[:, 0], true_target[:, 1], 1, alpha=0.1)
+                plt.scatter(Xi_posterior[:, 0], Xi_posterior[:, 1], alpha=0.1)
+                plt.show()
+                """
+
+
+
+            self.history.append({
+                "iteration": int(it),
+                "db_size": int(self.X_db.shape[0]),
+                "mean_radius": mean_radius,
+                "max_radius": max_radius,
+                "posterior_mode_weight": float(mode_w),
+                "n_flagged": int(n_flagged),
+                "rel_improvement": float(rel_impr) if not np.isnan(rel_impr) else np.nan,
+                "mode_shift": float(mode_shift) if not np.isnan(mode_shift) else np.nan,
+                "stop": bool(stop),
+                "stop_reason": reason,
+                "Xi_best95": self.X_db[self.post_weights_db > np.quantile(self.post_weights_db,0.95), :],
+            })
+
+            print(
+                f"[iter {it + 1}/{max_iter}] db={self.X_db.shape[0]} "
+                f"mean_radius={mean_radius:.4g} "
+                f"max_radius={max_radius:.4g}"
+                f" flagged={n_flagged}"
+                f"Wasserstein -> (Post||Target): {Wasser_Distance:.4f}"
+            )
+
+            if stop:
+                break
+
+            # Sample globally in theta-space, then simulate all designs
+            X_new, logq_new = self.sample_targeted_batch(
+                flagged_local_ids=flagged_local_ids,
+                n_new=n_new_per_iter,
+                inflate=inflate,
+                prior_weight=prior_weight,
+            )
+
+            # try sample_from_worst_ball
+
+            self.append_to_archive(X_new, logq_new)
+
+            prev_mean_radius = mean_radius
+            prev_mode = mode_x.copy()
+
+        # Final refresh after the last append
+        self.fit_local_models()
+        self.compute_log_posterior_weights_on_archive()
+
+        return pd.DataFrame(self.history), self.diagnostics()
+
+    def adaptive_refine(
+            self,
+            max_iter=20,
+            top_frac=0.20,
+            n_new_per_iter=100,
+            inflate=1.5,
+            prior_weight=0.20,
+            posterior_weight=0.50,
+            local_weight=0.30,
+            posterior_temp=0.70,
+            improve_tol=0.01,
+            patience=4,
+            min_iter=3,
+            n_post_pred=1000,
+            keep_best_state=True,
+            true_target=None,
+    ):
+        """
+        Adaptive refinement driven by an observable predictive criterion.
+
+        Main score:
+            predictive_score_t
+            = average response-space discrepancy between empirical data and
+              posterior predictive simulations across designs.
+
+        This is stable in practice because it does not require the true target
+        in theta-space.
+
+        Additional monitors:
+            - mean / max response-space radius
+            - posterior change between iterations in theta-space
+            - optional truth-based diagnostic if true_target is available
+
+        Returns
+        -------
+        hist : DataFrame
+        diag : DataFrame
+        """
+        self.history = []
+        best_pred_score = np.inf
+        best_iter = None
+        stagnant_rounds = 0
+        prev_mean_radius = None
+        prev_mode = None
+        prev_Xi = None
+        best_state = None
+
+        for it in range(max_iter):
+            # ----------------------------------------------
+            # refresh local models and archive posterior
+            self.fit_local_models()
+            self.compute_log_posterior_weights_on_archive()
+            diag = self.diagnostics().sort_values("priority", ascending=False).reset_index(drop=True)
+
+            mean_radius = float(diag["radius_y"].mean())
+            max_radius = float(diag["radius_y"].max())
+            mode_x, mode_w = self.posterior_mode_from_db()
+
+            # posterior predictive score (observable)
+            pred_score = self._posterior_predictive_score(
+                n_post=n_post_pred,
+                use_kde=False,
+                temp=posterior_temp,
+            )
+
+            # posterior-to-posterior change (proxy stability)
+            Xi = self.posterior_particles(n_samples=2000, replace=True)
+            theta_change = (
+                np.nan if prev_Xi is None
+                else float(np.sqrt(sliced_wasserstein_2(
+                    np.asarray(prev_Xi, dtype=float),
+                    np.asarray(Xi, dtype=float),
+                    n_proj=100
+                )))
+            )
+
+            # optional truth-based diagnostic for synthetic examples
+            if true_target is not None:
+                Wasser_Distance = float(np.sqrt(
+                    sliced_wasserstein_2(np.asarray(true_target, dtype=float), Xi, n_proj=200)
+                ))
+            else:
+                Wasser_Distance = None
+
+            rel_impr_radius = (
+                np.nan if prev_mean_radius is None
+                else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)
+            )
+            mode_shift = (
+                np.nan if prev_mode is None
+                else float(np.linalg.norm(mode_x - prev_mode))
+            )
+
+            # ----------------------------------------------
+            # best predictive checkpoint
+            improved = pred_score < (best_pred_score - improve_tol)
+            if improved:
+                best_pred_score = pred_score
+                best_iter = int(it)
+
+                if keep_best_state:
+                    best_state = {
+                        "X_db": self.X_db.copy(),
+                        "Y_db_by_design": {d: self.Y_db_by_design[d].copy() for d in self.designs},
+                        "log_prior_db": self.log_prior_db.copy(),
+                        "log_prop_db": self.log_prop_db.copy(),
+                    }
+                stagnant_rounds = 0
+            else:
+                stagnant_rounds += 1
+
+            # ----------------------------------------------
+            # diverse flagged locals
+            n_flagged = max(1, int(np.ceil(top_frac * len(diag))))
+            flagged_local_ids = self._select_diverse_flagged(diag, n_select=n_flagged, sep_scale=0.5)
+
+            # ----------------------------------------------
+            # stopping
+            stop = False
+            reason = "continue"
+
+            if it + 1 >= min_iter and stagnant_rounds >= patience:
+                stop = True
+                reason = "predictive stagnation"
+            elif it == max_iter - 1:
+                stop = True
+                reason = "max_iter"
+
+            self.history.append({
+                "iteration": int(it),
+                "db_size": int(self.X_db.shape[0]),
+                "mean_radius": mean_radius,
+                "max_radius": max_radius,
+                "posterior_mode_weight": float(mode_w),
+                "n_flagged": int(len(flagged_local_ids)),
+                "rel_improvement_radius": float(rel_impr_radius) if not np.isnan(rel_impr_radius) else np.nan,
+                "mode_shift": float(mode_shift) if not np.isnan(mode_shift) else np.nan,
+                "theta_change": float(theta_change) if not np.isnan(theta_change) else np.nan,
+                "predictive_score": float(pred_score),
+                "best_predictive_score_so_far": float(best_pred_score),
+                "best_iter_so_far": int(best_iter) if best_iter is not None else -1,
+                "truth_wasserstein": Wasser_Distance,
+                "stop": bool(stop),
+                "stop_reason": reason,
+            })
+
+            print(
+                f"[iter {it + 1}/{max_iter}] "
+                f"db={self.X_db.shape[0]} "
+                f"pred={pred_score:.4g} "
+                f"mean_radius={mean_radius:.4g} "
+                f"max_radius={max_radius:.4g} "
+                f"flagged={len(flagged_local_ids)} "
+                f"truth_W={Wasser_Distance if Wasser_Distance is not None else 'NA'}"
+            )
+
+            if stop:
+                break
+
+            # ----------------------------------------------
+            # stable 3-way enrichment
+            """
+            X_new, logq_new = self.sample_targeted_batch(
+                flagged_local_ids=flagged_local_ids,
+                n_new=n_new_per_iter,
+                inflate=inflate,
+                prior_weight=prior_weight,
+                posterior_weight=posterior_weight,
+                local_weight=local_weight,
+                posterior_temp=posterior_temp,
+                posterior_cov_scale=1.0,
+            )
+            """
+
+            X_new, logq_new, _ = self.sample_from_worst_ball(n_per_center=n_new_per_iter,
+                                                      inflate=inflate, kernel="gaussian",
+                                                      use_radius_only=True)
+
+            self.append_to_archive(X_new, logq_new)
+
+            prev_mean_radius = mean_radius
+            prev_mode = mode_x.copy()
+            prev_Xi = Xi.copy()
+
+            plt.scatter(true_target[:, 0], true_target[:, 1], 1, alpha=0.1, c='b')
+            plt.scatter(Xi[:, 0], Xi[:, 1], 10, alpha=0.1, c='r')
+            plt.scatter(X_new[:, 0], X_new[:, 1], 100, alpha=0.1, c='k')
+            plt.show()
+
+        # ----------------------------------------------
+        # restore best predictive state if requested
+        if keep_best_state and best_state is not None:
+            self.X_db = best_state["X_db"]
+            self.Y_db_by_design = best_state["Y_db_by_design"]
+            self.log_prior_db = best_state["log_prior_db"]
+            self.log_prop_db = best_state["log_prop_db"]
+
+        # final refresh
+        self.fit_local_models()
+        self.compute_log_posterior_weights_on_archive()
+
+        return pd.DataFrame(self.history), self.diagnostics()
+
+
+    # ------------------------------------------------------------------
+    # Convenience summaries
+    def archive_summary(self):
+        return {
+            "n_particles": int(self.X_db.shape[0]),
+            "d_x": int(self.d_x),
+            "d_y": int(self.d_y),
+            "n_designs": int(len(self.designs)),
+            "designs": list(self.designs),
+        }
+
+    def design_factor_on_archive(self):
+        """
+        Return a DataFrame with one column per design factor evaluated on the archive.
+        """
+        if self.post_weights_db is None:
+            self.compute_log_posterior_weights_on_archive()
+
+        out = pd.DataFrame({"idx": np.arange(self.X_db.shape[0])})
+        for d in self.designs:
+            out[f"logL_{d}"] = self.log_design_factor_by_design[d]
+        out["log_prior_minus_log_prop"] = self.log_prior_db - self.log_prop_db
+        out["log_post_weight"] = self.log_post_weights_db
+        out["post_weight"] = self.post_weights_db
+        return out
+
+    def sample_from_worst_ball(
+            self,
+            n_per_center=20,
+            inflate=1.0,
+            kernel="gaussian",
+            use_radius_only=True,
+    ):
+        """
+        Simple refinement:
+        1) pick the empirical response with the largest KNN ball
+        2) take its K reconstructed input neighbours
+        3) sample around each of those K input points
+        4) return the proposal log-density as well
+        """
+        self.fit_local_models()
+
+        diag = self.diagnostics().copy()
+        sort_col = "radius_y" if use_radius_only else "priority"
+        diag = diag.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+        worst_local_id = int(diag.iloc[0]["local_id"])
+        lm = self.local_models[worst_local_id]
+
+        centers = lm["Xi"]  # shape (K, d_x)
+        cov = inflate * lm["cov"]
+
+        X_new_parts = []
+
+        if kernel == "gaussian":
+            for mu in centers:
+                X_new_parts.append(
+                    self.rng.multivariate_normal(mu, cov, size=n_per_center)
+                )
+            X_new = np.vstack(X_new_parts)
+
+            # equal-weight Gaussian mixture log-density
+            log_parts = []
+            mix_w = 1.0 / len(centers)
+            for mu in centers:
+                log_parts.append(
+                    np.log(mix_w) + self._safe_mvn_logpdf(X_new, mu, cov)
+                )
+            logq_new = logsumexp(np.column_stack(log_parts), axis=1)
+
+        elif kernel == "uniform_box":
+            std = np.sqrt(np.diag(cov))
+            for mu in centers:
+                U = self.rng.uniform(
+                    low=mu - std,
+                    high=mu + std,
+                    size=(n_per_center, self.d_x),
+                )
+                X_new_parts.append(U)
+
+            X_new = np.vstack(X_new_parts)
+
+            # simple fallback: ignore proposal correction
+            logq_new = np.asarray(self.prior.logpdf(X_new), dtype=float)
+
+        else:
+            raise ValueError("kernel must be 'gaussian' or 'uniform_box'")
+
+        return X_new, logq_new, worst_local_id
+
+    def continuous_log_posterior(self, X, logq_fn=None):
+        """
+        Continuous posterior surrogate evaluated at arbitrary theta.
+
+        Target:
+            log p_hat(theta | D) =
+                log prior(theta)
+                + sum_e log L_e(theta)
+                - log q(theta)    [optional correction]
+
+        Parameters
+        ----------
+        X : array, shape (n, d_x) or (d_x,)
+            Evaluation points in parameter space.
+        logq_fn : callable or None
+            Optional callable:
+                logq_fn(X) -> array shape (n,)
+            representing the continuous proposal density correction.
+            If None, no proposal correction is applied.
+
+        Returns
+        -------
+        logp : ndarray, shape (n,)
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+
+        logp = np.asarray(self.prior.logpdf(X), dtype=float).reshape(-1)
+
+        for design in self.designs:
+            logp = logp + self.evaluate_design_factor_logpdf(X, design)
+
+        if logq_fn is not None:
+            logp = logp - np.asarray(logq_fn(X), dtype=float).reshape(-1)
+
+        return logp
+
+
     def sample_targeted_batch_v0( self,  flagged_local_ids,
-                               n_new=100,  inflate=1.0,
-                               prior_weight=0.10):
+                               n_new=100,  inflate=1.0, prior_weight=0.10):
         """
         Draw new theta particles from a mixture of flagged local kernels plus a
         small prior component.
@@ -671,14 +1423,9 @@ class AdaptiveInverseKNNKDE:
         )
         return X_new, logq_new
 
-    def sample_targeted_batch(
-            self,
-            flagged_local_ids,
-            n_new=100,
-            inflate=1.0,
-            prior_weight=0.10,
-            n_rep_per_choice=100,
-    ):
+    def sample_targeted_batch_v1( self, flagged_local_ids, n_new=100,  inflate=1.0,
+                                        prior_weight=0.10,
+                                        n_rep_per_choice=100, ):
         """
         Draw new theta particles from a mixture of flagged local kernels plus a
         small prior component.
@@ -695,7 +1442,6 @@ class AdaptiveInverseKNNKDE:
 
         # Number of source choices needed to produce about n_new samples
         n_choices = int(np.ceil(n_new / n_rep_per_choice))
-
         source_u = self.rng.uniform(size=n_choices)
         prior_mask = source_u < prior_weight
 
@@ -717,12 +1463,7 @@ class AdaptiveInverseKNNKDE:
                 comp = self.rng.choice(len(lm["weights"]), p=lm["weights"])
                 mu = lm["Xi"][comp]
                 cov = inflate * lm["cov"]
-
-                X_loc = self.rng.multivariate_normal(
-                    mean=mu,
-                    cov=cov,
-                    size=n_rep_per_choice,
-                )
+                X_loc = self.rng.multivariate_normal(mean=mu,  cov=cov,  size=n_rep_per_choice)
                 X_parts.append(np.atleast_2d(X_loc))
 
         if len(X_parts) == 0:
@@ -736,231 +1477,218 @@ class AdaptiveInverseKNNKDE:
         if X_new.shape[0] > n_new:
             X_new = X_new[:n_new]
 
-        logq_new = self._proposal_logpdf(
-            X_new,
-            flagged=flagged,
-            mix_w=mix_w,
-            prior_weight=prior_weight,
-            inflate=inflate,
-        )
+        logq_new = self._proposal_logpdf(    X_new,
+                                         flagged=flagged,   mix_w=mix_w,
+                                             prior_weight=prior_weight,    inflate=inflate, )
         return X_new, logq_new
 
 
-
-
-
-
-    def append_to_archive(self, X_new, logq_new):
+    def sample_targeted_batch(
+            self,
+            flagged_local_ids,
+            n_new=100,            inflate=1.5,
+            prior_weight=0.20,
+            posterior_weight=0.50,
+            local_weight=0.30,
+            posterior_temp=0.70,
+            posterior_cov_scale=1.0,
+    ):
         """
-        Append new shared particles and simulate them under all designs.
+        Stable 3-way proposal:
+            q_t(theta)
+            = alpha * prior
+            + beta  * tempered posterior KDE
+            + gamma * flagged local mixtures
+
+        This is substantially more stable than refining only the worst balls.
+
+        Parameters
+        ----------
+        flagged_local_ids : array-like
+            Local IDs selected for targeted repair.
+        n_new : int
+            Number of new particles.
+        inflate : float
+            Inflation of local covariances for flagged proposals.
+        prior_weight, posterior_weight, local_weight : float
+            Mixture weights. They will be renormalized internally.
+        posterior_temp : float
+            Temperature for posterior KDE proposal.
+        posterior_cov_scale : float
+            Scale factor for posterior KDE covariance.
         """
-        X_new = np.asarray(X_new, dtype=float)
-        logq_new = np.asarray(logq_new, dtype=float)
+        weights = np.array([prior_weight, posterior_weight, local_weight], dtype=float)
+        weights = np.maximum(weights, 1e-12)
+        weights /= np.sum(weights)
 
-        if X_new.ndim != 2 or X_new.shape[1] != self.d_x:
-            raise ValueError("X_new has wrong shape.")
-        if logq_new.shape[0] != X_new.shape[0]:
-            raise ValueError("logq_new length does not match X_new.")
+        alpha, beta, gamma = weights
 
-        Y_new_by_design = self._simulate_all_designs(X_new)
-        logp_new = np.asarray(self.prior.logpdf(X_new), dtype=float)
+        n_prior = self.rng.multinomial(int(n_new), weights)
 
-        self.X_db = np.vstack([self.X_db, X_new])
-        self.log_prior_db = np.concatenate([self.log_prior_db, logp_new])
-        self.log_prop_db = np.concatenate([self.log_prop_db, logq_new])
+        X_parts = []
+        logq_parts = []
 
-        for d in self.designs:
-            self.Y_db_by_design[d] = np.vstack([self.Y_db_by_design[d], Y_new_by_design[d]])
+        # ----------------------------------------------------------
+        # 1) Prior / global exploration
+        if n_prior[0] > 0:
+            Xp = self._prior_rvs(n_prior[0])
+            logq_p = np.asarray(self.prior.logpdf(Xp), dtype=float)
+            X_parts.append(Xp)
+            logq_parts.append(logq_p)
 
-    def adaptive_refine(self,
-                        max_iter=10,
-                        top_frac=0.30,
-                        n_new_per_iter=100,
-                        inflate=1.0,
-                        prior_weight=0.10,
-                        improve_tol=0.05,
-                        patience=3,
-                        target_shrink=0.60,
-                        min_iter=2,
-                        true_target=None):
+        # ----------------------------------------------------------
+        # 2) Tempered posterior KDE exploration
+        if n_prior[1] > 0:
+            Xpost, logq_post = self._sample_from_tempered_posterior_kde(
+                n_new=n_prior[1],
+                temp=posterior_temp,
+                cov_scale=posterior_cov_scale,
+            )
+            X_parts.append(Xpost)
+            logq_parts.append(logq_post)
 
-        """  Run the adaptive loop.
-            Stopping logic is based on:
-            - reduction in mean and max response-space radii
-            - stagnation in these diagnostics
-        """
-        self.history = []
-        stagnant_rounds = 0
+        # ----------------------------------------------------------
+        # 3) Targeted local repair
+        if n_prior[2] > 0 and len(flagged_local_ids) > 0:
+            flagged, mix_w = self._build_flagged_mixture(flagged_local_ids)
 
-        base_mean_radius = None
-        base_max_radius = None
-        prev_mean_radius = None
-        prev_mode = None
+            Xloc = np.zeros((n_prior[2], self.d_x), dtype=float)
+            chosen_flag = self.rng.choice(len(flagged), size=n_prior[2], p=mix_w)
 
-        for it in range(max_iter):
-            # Refit local models and posterior on current archive
-            self.fit_local_models()
-            self.compute_log_posterior_weights_on_archive()
-            diag = self.diagnostics().sort_values("priority", ascending=False).reset_index(drop=True)
-            mean_radius = float(diag["radius_y"].mean())
-            max_radius = float(diag["radius_y"].max())
-            mode_x, mode_w = self.posterior_mode_from_db()
+            for row, j in enumerate(chosen_flag):
+                lm = flagged[int(j)]
+                comp = self.rng.choice(len(lm["weights"]), p=lm["weights"])
+                mu = lm["Xi"][comp]
+                cov = inflate * lm["cov"]
+                Xloc[row] = self.rng.multivariate_normal(mu, cov)
 
-            """
-            plt.scatter(true_target[:,0],true_target[:,1])
-            plt.scatter(self.X_db[self.post_weights_db>1e-4,0],self.X_db[self.post_weights_db>1e-4,1]) 
-            plt.scatter(self.X_db[self.post_weights_db>0.001,0],self.X_db[self.post_weights_db>0.001,1]) 
-            plt.scatter(self.X_db[self.post_weights_db>0.02,0],self.X_db[self.post_weights_db>0.02,1]) 
-            plt.show()
-            """
-
-            if it == 0:
-                base_mean_radius = mean_radius
-                base_max_radius = max_radius
-
-            rel_impr = (  np.nan  if prev_mean_radius is None
-                          else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)  )
-            mode_shift = (  np.nan if prev_mode is None
-                            else float(np.linalg.norm(mode_x - prev_mode))             )
-
-            n_flagged = max(1, int(np.ceil(top_frac * len(diag))))
-            flagged_local_ids = diag["local_id"].iloc[:n_flagged].to_numpy()
-
-            reached_target = ( (mean_radius <= target_shrink * base_mean_radius) and
-                               (max_radius <= target_shrink * base_max_radius) )
-            stalled = ( prev_mean_radius is not None and
-                        rel_impr < improve_tol and
-                        (np.isnan(mode_shift) or mode_shift < 1e-6) )
-
-            stagnant_rounds = stagnant_rounds + 1 if stalled else 0
-
-            stop = False
-            reason = "continue"
-            if it + 1 >= min_iter and reached_target:
-                stop, reason = True, "radius target reached"
-            elif it + 1 >= min_iter and stagnant_rounds >= patience:
-                stop, reason = True, "stagnation"
-            elif it == max_iter - 1:
-                stop, reason = True, "max_iter"
-
-            self.history.append({
-                "iteration": int(it),
-                "db_size": int(self.X_db.shape[0]),
-                "mean_radius": mean_radius,
-                "max_radius": max_radius,
-                "posterior_mode_weight": float(mode_w),
-                "n_flagged": int(n_flagged),
-                "rel_improvement": float(rel_impr) if not np.isnan(rel_impr) else np.nan,
-                "mode_shift": float(mode_shift) if not np.isnan(mode_shift) else np.nan,
-                "stop": bool(stop),
-                "stop_reason": reason,
-                "Xi_best95": self.X_db[self.post_weights_db > np.quantile(self.post_weights_db,0.95), :],
-            })
-
-            print(
-                f"[iter {it + 1}/{max_iter}] db={self.X_db.shape[0]} "
-                f"mean_radius={mean_radius:.4g} "
-                f"max_radius={max_radius:.4g}"
-                f" flagged={n_flagged}")
-
-            if stop:
-                break
-
-            # Sample globally in theta-space, then simulate all designs
-            X_new, logq_new = self.sample_targeted_batch(
-                flagged_local_ids=flagged_local_ids,
-                n_new=n_new_per_iter,
+            logq_loc = self._proposal_logpdf(
+                Xloc,
+                flagged=flagged,
+                mix_w=mix_w,
+                prior_weight=0.0,  # local term only here; full mixture corrected below
                 inflate=inflate,
-                prior_weight=prior_weight,
             )
 
-            # try sample_from_worst_ball
+            X_parts.append(Xloc)
+            logq_parts.append(logq_loc)
 
-            self.append_to_archive(X_new, logq_new)
+        # ----------------------------------------------------------
+        # Stack proposed particles
+        if len(X_parts) == 0:
+            return np.empty((0, self.d_x)), np.empty((0,))
 
-            prev_mean_radius = mean_radius
-            prev_mode = mode_x.copy()
+        X_new = np.vstack(X_parts)
 
-        # Final refresh after the last append
-        self.fit_local_models()
-        self.compute_log_posterior_weights_on_archive()
+        # ----------------------------------------------------------
+        # Full mixture proposal correction
+        # q(theta) = alpha*pi + beta*q_post + gamma*q_local
+        parts = []
 
-        return pd.DataFrame(self.history), self.diagnostics()
+        if alpha > 0:
+            parts.append(np.log(alpha + 1e-300) + np.asarray(self.prior.logpdf(X_new), dtype=float))
 
-    # ------------------------------------------------------------------
-    # Convenience summaries
-    def archive_summary(self):
-        return {
-            "n_particles": int(self.X_db.shape[0]),
-            "d_x": int(self.d_x),
-            "d_y": int(self.d_y),
-            "n_designs": int(len(self.designs)),
-            "designs": list(self.designs),
-        }
+        if beta > 0:
+            parts.append(np.log(beta + 1e-300) +
+                         self._posterior_kde_logpdf(X_new, temp=posterior_temp, cov_scale=posterior_cov_scale))
 
-    def design_factor_on_archive(self):
+        if gamma > 0 and len(flagged_local_ids) > 0:
+            flagged, mix_w = self._build_flagged_mixture(flagged_local_ids)
+            parts.append(np.log(gamma + 1e-300) +
+                         self._proposal_logpdf(
+                             X_new,
+                             flagged=flagged,
+                             mix_w=mix_w,
+                             prior_weight=0.0,
+                             inflate=inflate,
+                         ))
+
+        logq_new = logsumexp(np.column_stack(parts), axis=1)
+        return X_new, logq_new
+
+
+    def sample_from_posterior_mcmc(
+            self,
+            n_samples=2000,
+            burn_in=1000,
+            thin=1,
+            x0=None,
+            proposal_cov=None,
+            proposal_scale=1.0,
+            logq_fn=None,
+    ):
         """
-        Return a DataFrame with one column per design factor evaluated on the archive.
+        Random-walk Metropolis sampler for the continuous posterior surrogate.
+
+        Parameters
+        ----------
+        n_samples : int    Number of retained posterior samples.
+        burn_in : int    Number of burn-in iterations.
+        thin : int  Keep one sample every `thin` steps after burn-in.
+        x0 : array-like or None   Initial point. If None, starts from the archive posterior mode.
+        proposal_cov : ndarray or None
+            Proposal covariance for the Gaussian random walk.
+            If None, uses the posterior-weighted archive covariance.
+        proposal_scale : float
+            Global multiplier on proposal_cov.
+        logq_fn : callable or None
+            Optional continuous proposal correction log-density.
+            If None, samples from the uncorrected continuous surrogate.
+
+        Returns -------
+        X_chain : ndarray, shape (n_samples, d_x)   Posterior MCMC samples.
+        info : dict      Diagnostics such as acceptance rate.
         """
+        if len(self.local_models) == 0:
+            self.fit_local_models()
         if self.post_weights_db is None:
             self.compute_log_posterior_weights_on_archive()
 
-        out = pd.DataFrame({"idx": np.arange(self.X_db.shape[0])})
-        for d in self.designs:
-            out[f"logL_{d}"] = self.log_design_factor_by_design[d]
-        out["log_prior_minus_log_prop"] = self.log_prior_db - self.log_prop_db
-        out["log_post_weight"] = self.log_post_weights_db
-        out["post_weight"] = self.post_weights_db
-        return out
+        # Start at archive posterior mode if not provided
+        if x0 is None:
+            x0, _ = self.posterior_mode_from_db()
 
-    def sample_from_worst_ball(
-            self,
-            n_per_center=5,
-            inflate=1.0,
-            kernel="gaussian",
-            use_radius_only=True,
-    ):
-        """
-        Simpler refinement:
-        1) pick the empirical response with the largest KNN ball
-        2) take its K reconstructed input neighbours
-        3) sample around each of those K input points
-        """
-        self.fit_local_models()
+        x_curr = np.asarray(x0, dtype=float).reshape(-1)
 
-        diag = self.diagnostics().copy()
-        sort_col = "radius_y" if use_radius_only else "priority"
-        diag = diag.sort_values(sort_col, ascending=False).reset_index(drop=True)
+        # Default proposal covariance from weighted archive posterior
+        if proposal_cov is None:
+            proposal_cov = self._weighted_cov(self.X_db, self.post_weights_db, self.ridge)
 
-        worst_local_id = int(diag.iloc[0]["local_id"])
-        lm = self.local_models[worst_local_id]
+        proposal_cov = proposal_scale * np.asarray(proposal_cov, dtype=float)
 
-        centers = lm["Xi"]  # shape (K, d_x)
-        cov = inflate * lm["cov"]
+        n_total = int(burn_in + n_samples * thin)
+        chain = np.zeros((n_samples, self.d_x), dtype=float)
 
-        X_new_parts = []
+        logp_curr = self.continuous_log_posterior(x_curr[None, :], logq_fn=logq_fn)[0]
 
-        if kernel == "gaussian":
-            for mu in centers:
-                X_new_parts.append(
-                    self.rng.multivariate_normal(mu, cov, size=n_per_center)
-                )
+        n_accept = 0
+        save_id = 0
 
-        elif kernel == "uniform_box":
-            std = np.sqrt(np.diag(cov))
-            for mu in centers:
-                U = self.rng.uniform(
-                    low=mu - std,
-                    high=mu + std,
-                    size=(n_per_center, self.d_x),
-                )
-                X_new_parts.append(U)
+        for t in range(n_total):
+            x_prop = self.rng.multivariate_normal(mean=x_curr, cov=proposal_cov)
+            logp_prop = self.continuous_log_posterior(x_prop[None, :], logq_fn=logq_fn)[0]
 
-        else:
-            raise ValueError("kernel must be 'gaussian' or 'uniform_box'")
+            log_alpha = logp_prop - logp_curr
+            if np.log(self.rng.uniform()) < log_alpha:
+                x_curr = x_prop
+                logp_curr = logp_prop
+                n_accept += 1
 
-        X_new = np.vstack(X_new_parts)
-        return X_new, worst_local_id, lm
+            if t >= burn_in and ((t - burn_in) % thin == 0):
+                chain[save_id] = x_curr
+                save_id += 1
+
+        info = {
+            "accept_rate": n_accept / max(n_total, 1),
+            "x0": np.asarray(x0, dtype=float),
+            "proposal_cov": proposal_cov,
+            "burn_in": int(burn_in),
+            "thin": int(thin),
+            "n_total_steps": int(n_total),
+        }
+        return chain, info
+
+
 
 class UniformBoxPrior:
     """
@@ -997,82 +1725,3 @@ class UniformBoxPrior:
             else random_state
         )
         return rng.uniform(self.low, self.high, size=(size, self.d_x))
-
-
-
-if __name__ == '__main__':
-    print("=== DEMO: Posterior Progression Towards True Target ===")
-    # --------------------------------------------------------------
-    # Forward model with explicit design argument
-    from resources.loader_usecases import prepare_case
-    demo_model, _, _ = prepare_case(1, Nemp=10, Nsim=1000)
-
-    # --------------------------------------------------------------
-    # Synthetic "true posterior" used only to generate empirical data
-    rng = np.random.default_rng(123)
-    m = 100
-    weights = np.array([0.55, 0.45])
-    mus_true = np.array([[-0.5,  1.0],   [ 0.2, -1.0]])
-    covs_true = np.array([[[ 0.15,  0.05], [ 0.05,  0.20]], [[ 0.20, -0.03], [-0.03,  0.10]] ])
-    z = rng.choice(2, size=m, p=weights)
-    X_latent = np.zeros((m, 2))
-    for k in range(2):
-        idx = (z == k)
-        X_latent[idx] = rng.multivariate_normal(mus_true[k], covs_true[k], size=idx.sum())
-    # --------------------------------------------------------------
-    # One or more experimental designs
-    designs = [-1.0, 2.0, 4.0]
-    Y_emp_by_design = { xi: demo_model(X_latent, xi) for xi in designs }
-
-    # --------------------------------------------------------------
-    prior = UniformBoxPrior(low=[-15,-15], high=[15,15])
-
-    # --------------------------------------------------------------
-    # Instantiate the NEW solver
-    solver = AdaptiveInverseKNNKDE(   model=demo_model,
-                                            Y_emp_by_design=Y_emp_by_design,
-                                            prior=prior,
-                                            N0=700,
-                                            K=50,
-                                            ridge=1e-3,
-                                            seed=123,
-                                            )
-
-    print("Initial archive summary:", solver.archive_summary())
-
-    # --------------------------------------------------------------
-    # Adaptive refinement
-    n_new_per_iter = 100
-    top_frac = 0.2
-
-    hist, diag = solver.adaptive_refine(
-        max_iter=15,
-        top_frac=top_frac,
-        n_new_per_iter=n_new_per_iter,
-        inflate=1.0,
-        prior_weight=0.10,
-        improve_tol=0.05,
-        patience=3,
-        target_shrink=0.60,
-        min_iter=5,
-    )
-
-    print("\n=== Refinement history ===")
-    print(hist)
-
-    print("\n=== Final diagnostics ===")
-    print(diag.head())
-
-    # --------------------------------------------------------------
-    # Posterior summaries from the weighted shared archive
-    # --------------------------------------------------------------
-    post_mean = solver.posterior_mean()
-    post_mode, post_mode_w = solver.posterior_mode_from_db()
-
-    print("\nPosterior mean:", post_mean)
-    print("Posterior mode (best archive particle):", post_mode)
-    print("Posterior mode weight:", post_mode_w)
-
-    # Optional posterior particle resampling
-    X_post = solver.posterior_particles(n_samples=5000, replace=True)
-    print("Posterior particle sample shape:", X_post.shape)
