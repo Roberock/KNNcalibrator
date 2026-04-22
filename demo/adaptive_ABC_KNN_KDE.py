@@ -1228,11 +1228,11 @@ class AdaptiveInverseKNNKDE:
             prev_mean_radius = mean_radius
             prev_mode = mode_x.copy()
             prev_Xi = Xi.copy()
-
-            plt.scatter(true_target[:, 0], true_target[:, 1], 1, alpha=0.1, c='b')
-            plt.scatter(Xi[:, 0], Xi[:, 1], 10, alpha=0.1, c='r')
-            plt.scatter(X_new[:, 0], X_new[:, 1], 100, alpha=0.1, c='k')
-            plt.show()
+            if true_target is not None:
+                plt.scatter(true_target[:, 0], true_target[:, 1], 1, alpha=0.1, c='b')
+                plt.scatter(Xi[:, 0], Xi[:, 1], 10, alpha=0.1, c='r')
+                plt.scatter(X_new[:, 0], X_new[:, 1], 100, alpha=0.1, c='k')
+                plt.show()
 
         # ----------------------------------------------
         # restore best predictive state if requested
@@ -1725,3 +1725,815 @@ class UniformBoxPrior:
             else random_state
         )
         return rng.uniform(self.low, self.high, size=(size, self.d_x))
+
+
+
+
+class SimpleAdaptiveKNNABC:
+    """
+    Minimal adaptive KNN-ABC / KNN-KDE inverse solver.
+
+    Core idea
+    ---------
+    1) Keep a shared archive of theta particles.
+    2) For each design and empirical observation:
+         - find K nearest simulated responses,
+         - map them back to theta-space,
+         - build a local weighted Gaussian mixture.
+    3) Combine all local mixtures design-by-design to get posterior weights
+       on the archive.
+    4) Refine by sampling around the worst KNN ball.
+
+    Assumptions
+    -----------
+    - model(X, design) -> array of simulated outputs
+    - prior.rvs(size=...) and prior.logpdf(X) exist
+    """
+
+    def __init__(
+        self,
+        model,
+        Y_emp_by_design,
+        prior,
+        sim_db=None,
+        N0=500,
+        K=10,
+        ridge=1e-3,
+        seed=123,
+        knn_metric="euclidean",
+    ):
+        self.model = model
+        self.prior = prior
+        self.K = int(K)
+        self.ridge = float(ridge)
+        self.knn_metric = knn_metric
+        self.rng = np.random.default_rng(seed)
+
+        self.designs = list(Y_emp_by_design.keys())
+        self.Y_emp_by_design = {
+            d: self._ensure_2d(Y_emp_by_design[d]) for d in self.designs
+        }
+
+        self.d_x = self._infer_dx()
+        self.X_db = None
+        self.Y_db_by_design = {}
+        self.log_prior_db = None
+        self.log_prop_db = None
+
+        self.local_models = []
+        self.log_post_weights_db = None
+        self.post_weights_db = None
+
+        if sim_db is None:
+            self._initialize_prior_db(N0)
+        else:
+            self._load_db(sim_db)
+
+    # ------------------------------------------------------------------
+    # basic utilities
+    def _infer_dx(self):
+        if hasattr(self.prior, "d_x"):
+            return int(self.prior.d_x)
+        if hasattr(self.prior, "low") and hasattr(self.prior, "high"):
+            return len(np.asarray(self.prior.low))
+        if hasattr(self.prior, "mean"):
+            return len(np.asarray(self.prior.mean))
+        raise ValueError("Cannot infer d_x from prior.")
+
+    @staticmethod
+    def _ensure_2d(Y):
+        Y = np.asarray(Y, dtype=float)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        return Y
+
+    def _prior_rvs(self, size):
+        X = self.prior.rvs(size=size)
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            X = X.reshape(-1, self.d_x)
+        return X
+
+    def _simulate_all_designs(self, X):
+        X = np.asarray(X, dtype=float)
+        out = {}
+        for d in self.designs:
+            out[d] = self._ensure_2d(self.model(X, d))
+        return out
+
+    def _initialize_prior_db(self, N0):
+        X = self._prior_rvs(N0)
+        Y_by_design = self._simulate_all_designs(X)
+        logp = np.asarray(self.prior.logpdf(X), dtype=float)
+
+        self.X_db = X
+        self.Y_db_by_design = Y_by_design
+        self.log_prior_db = logp
+        self.log_prop_db = logp.copy()
+
+    def _load_db(self, sim_db):
+        self.X_db = np.asarray(sim_db["X"], dtype=float)
+        self.Y_db_by_design = {
+            d: self._ensure_2d(sim_db["Y_by_design"][d]) for d in self.designs
+        }
+        self.log_prior_db = np.asarray(
+            sim_db.get("log_prior", self.prior.logpdf(self.X_db)),
+            dtype=float,
+        )
+        self.log_prop_db = np.asarray(
+            sim_db.get("log_prop", self.log_prior_db.copy()),
+            dtype=float,
+        )
+
+    @staticmethod
+    def _safe_mvn_logpdf(X, mean, cov):
+        return multivariate_normal(mean=mean, cov=cov, allow_singular=True).logpdf(X)
+
+    def _weighted_cov(self, X, w):
+        w = np.asarray(w, dtype=float)
+        w = w / max(w.sum(), 1e-300)
+        mu = np.sum(X * w[:, None], axis=0)
+        Xc = X - mu
+        denom = max(1e-12, 1.0 - np.sum(w**2))
+        cov = (Xc.T * w) @ Xc / denom
+        return cov + self.ridge * np.eye(X.shape[1])
+
+    # ------------------------------------------------------------------
+    # step 1: build local models
+    def fit_local_models(self):
+        self.local_models = []
+        n_db = self.X_db.shape[0]
+        K_eff = min(self.K, n_db)
+
+        for design in self.designs:
+            Y_emp = self.Y_emp_by_design[design]
+            Y_sim = self.Y_db_by_design[design]
+
+            scaler = StandardScaler()
+            Y_sim_s = scaler.fit_transform(Y_sim)
+            Y_emp_s = scaler.transform(Y_emp)
+
+            knn = NearestNeighbors(n_neighbors=K_eff, metric=self.knn_metric)
+            knn.fit(Y_sim_s)
+            distances, indices = knn.kneighbors(Y_emp_s)
+
+            for i in range(Y_emp.shape[0]):
+                idx = indices[i]
+                Xi = self.X_db[idx]
+                di = distances[i]
+
+                eps_i = float(np.max(di) + 1e-12)
+                log_import = self.log_prior_db[idx] - self.log_prop_db[idx]
+
+                logw = -0.5 * (di / eps_i) ** 2 + log_import
+                logw -= logsumexp(logw)
+                w = np.exp(logw)
+
+                cov_i = self._weighted_cov(Xi, w)
+
+                self.local_models.append({
+                    "design": design,
+                    "empirical_id": i,
+                    "indices": idx,
+                    "Xi": Xi,
+                    "weights": w,
+                    "cov": cov_i,
+                    "radius_y": float(np.max(di)),
+                    "eps": eps_i,
+                })
+
+        return self.local_models
+
+    # ------------------------------------------------------------------
+    # step 2: posterior on archive
+    def _local_kernel_logpdf(self, X, lm, inflate=1.0):
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        cov = inflate * lm["cov"]
+
+        parts = []
+        for wk, mu in zip(lm["weights"], lm["Xi"]):
+            parts.append(np.log(wk + 1e-300) + self._safe_mvn_logpdf(X, mu, cov))
+        return logsumexp(np.column_stack(parts), axis=1)
+
+    def compute_posterior_weights(self, inflate=1.0):
+        if not self.local_models:
+            self.fit_local_models()
+
+        logw = self.log_prior_db - self.log_prop_db
+
+        for design in self.designs:
+            lms = [lm for lm in self.local_models if lm["design"] == design]
+            local_logs = [self._local_kernel_logpdf(self.X_db, lm, inflate=inflate) for lm in lms]
+            logL = logsumexp(np.column_stack(local_logs), axis=1) - np.log(len(lms))
+            logw = logw + logL
+
+        logw -= logsumexp(logw)
+        self.log_post_weights_db = logw
+        self.post_weights_db = np.exp(logw)
+        return self.post_weights_db
+
+    def posterior_particles(self, n_samples=1000):
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+        idx = self.rng.choice(
+            self.X_db.shape[0],
+            size=n_samples,
+            replace=True,
+            p=self.post_weights_db,
+        )
+        return self.X_db[idx]
+
+    def posterior_pdf(self, X, cov_scale=1.0, return_log=False):
+        """
+        Continuous posterior density from the weighted archive support.
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+
+        w = np.asarray(self.post_weights_db, dtype=float)
+        w = w / np.sum(w)
+
+        # global weighted covariance of archive support
+        cov = self._weighted_cov(self.X_db, w)
+        cov = float(cov_scale) * cov
+
+        log_parts = []
+        for wk, mu in zip(w, self.X_db):
+            log_parts.append(
+                np.log(wk + 1e-300) + self._safe_mvn_logpdf(X, mu, cov)
+            )
+
+        log_pdf = logsumexp(np.column_stack(log_parts), axis=1)
+        return log_pdf if return_log else np.exp(log_pdf)
+
+    def sample_posterior_particles_smooth(self, n_samples=1000, cov_scale=1.0):
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+
+        w = np.asarray(self.post_weights_db, dtype=float)
+        w = w / w.sum()
+
+        idx = self.rng.choice(self.X_db.shape[0], size=n_samples, replace=True, p=w)
+
+        cov = self._weighted_cov(self.X_db, w)
+        cov = cov_scale * cov
+
+        X_new = np.empty((n_samples, self.d_x), dtype=float)
+        for i, j in enumerate(idx):
+            X_new[i] = self.rng.multivariate_normal(self.X_db[j], cov)
+
+        return X_new
+
+
+    def posterior_mode(self):
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+        j = int(np.argmax(self.post_weights_db))
+        return self.X_db[j]
+
+    # ------------------------------------------------------------------
+    # step 3: refinement
+    def diagnostics(self):
+        if not self.local_models:
+            self.fit_local_models()
+
+        radii = np.array([lm["radius_y"] for lm in self.local_models], dtype=float)
+        spreads = np.array([np.trace(lm["cov"]) for lm in self.local_models], dtype=float)
+
+        return {
+            "mean_radius": float(np.mean(radii)),
+            "max_radius": float(np.max(radii)),
+            "worst_id": int(np.argmax(radii)),
+            "radii": radii,
+            "spreads": spreads,
+        }
+
+    def sample_from_worst_ball(self, n_per_center=20, inflate=1.0):
+        """
+        Simplest targeted enrichment:
+        - find local model with largest radius
+        - sample around its K mapped-back neighbours
+        """
+        if not self.local_models:
+            self.fit_local_models()
+
+        diag = self.diagnostics()
+        lm = self.local_models[diag["worst_id"]]
+
+        centers = lm["Xi"]
+        cov = inflate * lm["cov"]
+
+        X_new_parts = []
+        for mu in centers:
+            X_new_parts.append(
+                self.rng.multivariate_normal(mu, cov, size=n_per_center)
+            )
+        X_new = np.vstack(X_new_parts)
+
+        # equal-weight Gaussian mixture proposal density
+        log_parts = []
+        mix_w = 1.0 / len(centers)
+        for mu in centers:
+            log_parts.append(np.log(mix_w) + self._safe_mvn_logpdf(X_new, mu, cov))
+        logq_new = logsumexp(np.column_stack(log_parts), axis=1)
+
+        return X_new, logq_new
+
+    def append_to_archive(self, X_new, logq_new):
+        X_new = np.asarray(X_new, dtype=float)
+        logq_new = np.asarray(logq_new, dtype=float)
+
+        Y_new_by_design = self._simulate_all_designs(X_new)
+        logp_new = np.asarray(self.prior.logpdf(X_new), dtype=float)
+
+        self.X_db = np.vstack([self.X_db, X_new])
+        self.log_prior_db = np.concatenate([self.log_prior_db, logp_new])
+        self.log_prop_db = np.concatenate([self.log_prop_db, logq_new])
+
+        for d in self.designs:
+            self.Y_db_by_design[d] = np.vstack([self.Y_db_by_design[d], Y_new_by_design[d]])
+
+    def posterior_pdf(self, X, cov_scale=1.0):
+        """
+        Smooth posterior density obtained by KDE over the weighted archive posterior.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_eval, d_x) or (d_x,)
+            Evaluation points.
+        cov_scale : float
+            Multiplier for the posterior covariance. Increase it if the density
+            looks too spiky, decrease it if it looks too blurred.
+
+        Returns
+        -------
+        pdf : ndarray, shape (n_eval,)
+            Estimated posterior density at the evaluation points.
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+
+        # global weighted covariance of the posterior support
+        cov = self._weighted_cov(self.X_db, self.post_weights_db)
+        cov = float(cov_scale) * cov
+
+        parts = []
+        for w, mu in zip(self.post_weights_db, self.X_db):
+            parts.append(
+                np.log(w + 1e-300) + self._safe_mvn_logpdf(X, mu, cov)
+            )
+
+        return np.exp(logsumexp(np.column_stack(parts), axis=1))
+
+
+    def _posterior_predictive_score(self, n_post=1000):
+        """
+        Observable predictive discrepancy:
+            compare posterior predictive responses to empirical responses in Y-space.
+
+        Returns
+        -------
+        score : float
+            Average sqrt(sliced_wasserstein_2) across designs.
+            Smaller is better.
+        """
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+        if self.post_weights_db is None:
+            self.compute_posterior_weights()
+
+        X_post = self.posterior_particles(n_samples=n_post)
+
+        vals = []
+        for design in self.designs:
+            Y_pred = self._ensure_2d(self.model(X_post, design))
+            Y_emp = self.Y_emp_by_design[design]
+            vals.append(np.sqrt(sliced_wasserstein_2(
+                np.asarray(Y_emp, dtype=float),
+                np.asarray(Y_pred, dtype=float),
+                n_proj=100
+            )))
+        return float(np.mean(vals))
+
+    def evaluate_design_factor_logpdf(self, X, design, inflate=1.0):
+        """
+        Evaluate the design-specific surrogate factor at arbitrary X:
+            L_e(theta) = average of local theta-space kernel mixtures for design e
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        lms = [lm for lm in self.local_models if lm["design"] == design]
+        if len(lms) == 0:
+            raise ValueError(f"No local models found for design {design}. Run fit_local_models().")
+
+        local_logs = [self._local_kernel_logpdf(X, lm, inflate=inflate) for lm in lms]
+        return logsumexp(np.column_stack(local_logs), axis=1) - np.log(len(lms))
+
+    def log_posterior_surrogate(self, X, inflate=1.0):
+        """
+        Unnormalized log surrogate posterior at arbitrary X:
+            log pi(theta) - log q(theta) + sum_e log L_e(theta)
+
+        In the simplified setting we usually do not know log q(theta) away from
+        the archive, so this version uses only log prior + surrogate factors.
+
+        If your prior archive is all prior-drawn, this is perfectly consistent
+        with the simple implementation.
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+
+        logp = np.asarray(self.prior.logpdf(X), dtype=float)
+        for design in self.designs:
+            logp = logp + self.evaluate_design_factor_logpdf(X, design, inflate=inflate)
+        return logp
+
+    def _local_center(self, lm):
+        """
+        Weighted local mean in theta-space.
+        """
+        return np.sum(lm["Xi"] * lm["weights"][:, None], axis=0)
+
+    def sample_mcmc_from_flagged(
+            self,
+            n_chains=5,
+            steps_per_chain=50,
+            burnin=20,
+            top_frac=0.2,
+            proposal_scale=0.5,
+            inflate=1.0,
+            start_mode="mean",
+            keep_every=5,
+            return_all_samples=False,
+    ):
+        """
+        Run short random-walk MH chains from flagged local regions.
+
+        Parameters
+        ----------
+        n_chains : int
+            Number of flagged local regions / chains to use.
+        steps_per_chain : int
+            MH steps per chain.
+        burnin : int
+            Number of initial iterations to discard.
+        top_frac : float
+            Fraction of worst local models (by radius) considered as candidates.
+        proposal_scale : float
+            Proposal covariance multiplier:
+                theta' ~ N(theta, proposal_scale^2 * cov_local)
+        inflate : float
+            Inflation used in the surrogate posterior local kernels.
+        start_mode : {"mean", "neighbor"}
+            How to initialize each chain:
+            - "mean": weighted local mean
+            - "neighbor": randomly chosen mapped-back neighbor
+        keep_every : int
+            Thinning after burnin.
+        return_all_samples : bool
+            If True, return all kept MCMC samples.
+            If False, return one final sample per chain.
+
+        Returns
+        -------
+        X_new : ndarray, shape (n_samples, d_x)
+            New candidate particles.
+        logq_new : ndarray, shape (n_samples,)
+            Approximate proposal log-density based on the flagged-start mixture.
+            This is a rough approximation, good enough for archive bookkeeping.
+        info : dict
+            Diagnostics such as acceptance rates and selected local ids.
+        """
+        if len(self.local_models) == 0:
+            self.fit_local_models()
+
+        # ------------------------------------------------------------
+        # 1) select flagged locals by radius
+        radii = np.array([lm["radius_y"] for lm in self.local_models], dtype=float)
+        n_pool = max(1, int(np.ceil(top_frac * len(radii))))
+        cand_ids = np.argsort(radii)[-n_pool:]  # worst radii
+        cand_ids = cand_ids[::-1]  # descending order
+
+        if len(cand_ids) == 0:
+            raise ValueError("No candidate flagged locals found.")
+
+        chosen_ids = cand_ids[: min(n_chains, len(cand_ids))]
+        flagged = [self.local_models[int(i)] for i in chosen_ids]
+
+        # ------------------------------------------------------------
+        # 2) starting points and proposal covariances
+        starts = []
+        prop_covs = []
+        centers = []
+
+        for lm in flagged:
+            center = self._local_center(lm)
+            centers.append(center)
+
+            if start_mode == "mean":
+                x0 = center.copy()
+            elif start_mode == "neighbor":
+                j = self.rng.choice(len(lm["Xi"]), p=lm["weights"])
+                x0 = lm["Xi"][j].copy()
+            else:
+                raise ValueError("start_mode must be 'mean' or 'neighbor'.")
+
+            starts.append(x0)
+            prop_covs.append((proposal_scale ** 2) * lm["cov"])
+
+        starts = np.asarray(starts, dtype=float)
+        centers = np.asarray(centers, dtype=float)
+
+        # ------------------------------------------------------------
+        # 3) run short MH chains
+        kept_samples = []
+        acc_rates = []
+
+        for c in range(len(flagged)):
+            x = starts[c].copy()
+            logpx = float(self.log_posterior_surrogate(x[None, :], inflate=inflate)[0])
+
+            n_acc = 0
+            chain_kept = []
+
+            for t in range(steps_per_chain):
+                x_prop = self.rng.multivariate_normal(mean=x, cov=prop_covs[c])
+                logp_prop = float(self.log_posterior_surrogate(x_prop[None, :], inflate=inflate)[0])
+
+                log_alpha = logp_prop - logpx
+                if np.log(self.rng.uniform()) < min(0.0, log_alpha):
+                    x = x_prop
+                    logpx = logp_prop
+                    n_acc += 1
+
+                if t >= burnin and ((t - burnin) % keep_every == 0):
+                    chain_kept.append(x.copy())
+
+            acc_rates.append(n_acc / max(steps_per_chain, 1))
+
+            if len(chain_kept) == 0:
+                chain_kept = [x.copy()]
+
+            if return_all_samples:
+                kept_samples.extend(chain_kept)
+            else:
+                kept_samples.append(chain_kept[-1])
+
+        X_new = np.asarray(kept_samples, dtype=float)
+
+        # ------------------------------------------------------------
+        # 4) rough proposal log-density for bookkeeping
+        # We approximate q_new as a mixture over flagged starting regions:
+        #
+        #   q(theta) = average_j N(theta ; center_j, prop_cov_j + local_cov_j)
+        #
+        # This is not the exact MH path density, but it is a practical
+        # approximation if you want to keep log_prop_db bookkeeping.
+        log_parts = []
+        mix_w = 1.0 / len(flagged)
+
+        for j, lm in enumerate(flagged):
+            approx_cov = prop_covs[j] + lm["cov"]
+            log_parts.append(
+                np.log(mix_w) + self._safe_mvn_logpdf(X_new, centers[j], approx_cov)
+            )
+
+        logq_new = logsumexp(np.column_stack(log_parts), axis=1)
+
+        info = {
+            "selected_local_ids": [int(i) for i in chosen_ids],
+            "acceptance_rates": acc_rates,
+            "mean_acceptance": float(np.mean(acc_rates)),
+            "n_returned": int(X_new.shape[0]),
+        }
+
+        return X_new, logq_new, info
+
+    # ------------------------------------------------------------------
+
+    def adaptive_refine(
+            self,
+            max_iter=20,
+            top_frac=0.20,
+            n_new_per_iter=10,
+            inflate=1.0,
+            improve_tol=0.01,
+            patience=4,
+            min_iter=3,
+            n_post_pred=1000,
+            sampler_mcmcm=False, # 'mcmc' or 'ball'
+            keep_best_state=True,
+            true_target=None,
+            verbose=True,
+    ):
+        """
+        Simplified adaptive refinement, but with the same history keys as the
+        previous richer implementation.
+
+        History keys kept:
+            iteration
+            db_size
+            mean_radius
+            max_radius
+            posterior_mode_weight
+            n_flagged
+            rel_improvement_radius
+            mode_shift
+            theta_change
+            predictive_score
+            best_predictive_score_so_far
+            best_iter_so_far
+            truth_wasserstein
+            stop
+            stop_reason
+        """
+        self.history = []
+        best_pred_score = np.inf
+        best_iter = None
+        stagnant_rounds = 0
+        prev_mean_radius = None
+        prev_mode = None
+        prev_Xi = None
+        best_state = None
+
+        for it in range(max_iter):
+            # ----------------------------------------------
+            # refresh local models and archive posterior
+            self.fit_local_models()
+            self.compute_posterior_weights(inflate=1.0)
+
+            diag_df = self.diagnostics()
+            radii = np.asarray(diag_df["radii"], dtype=float)
+
+            mean_radius = float(np.mean(radii))
+            max_radius = float(np.max(radii))
+            mode_x = self.posterior_mode()
+            mode_w = float(np.max(self.post_weights_db))
+
+            # ----------------------------------------------
+            # predictive score wasser
+            pred_score = self._posterior_predictive_score(n_post=n_post_pred)
+
+            # posterior-to-posterior change
+            Xi = self.posterior_particles(n_samples=2000)
+            theta_change = (
+                np.nan if prev_Xi is None
+                else float(np.sqrt(sliced_wasserstein_2(
+                    np.asarray(prev_Xi, dtype=float),
+                    np.asarray(Xi, dtype=float),
+                    n_proj=100
+                )))
+            )
+
+            # optional truth-based diagnostic for synthetic examples
+            if true_target is not None:
+                TT = np.asarray(true_target, dtype=float)
+                if TT.ndim == 1:
+                    TT = TT.reshape(1, -1)
+
+                if TT.shape[1] == Xi.shape[1]:
+                    Wasser_Distance = float(np.sqrt(
+                        sliced_wasserstein_2(TT, Xi, n_proj=200)
+                    ))
+                else:
+                    Wasser_Distance = None
+                    print(
+                        f"[adaptive_refine] skipping truth-based Wasserstein: "
+                        f"true_target dim={TT.shape[1]}, posterior dim={Xi.shape[1]}"
+                    )
+            else:
+                Wasser_Distance = None
+
+            rel_impr_radius = (
+                np.nan if prev_mean_radius is None
+                else (prev_mean_radius - mean_radius) / max(prev_mean_radius, 1e-12)
+            )
+            mode_shift = (
+                np.nan if prev_mode is None
+                else float(np.linalg.norm(mode_x - prev_mode))
+            )
+
+            # ----------------------------------------------
+            # "flagged" count: keep same semantics as old history
+            n_flagged = max(1, int(np.ceil(top_frac * len(radii))))
+
+            # ----------------------------------------------
+            # best predictive checkpoint
+            improved = pred_score < (best_pred_score - improve_tol)
+            if improved:
+                best_pred_score = pred_score
+                best_iter = int(it)
+
+                if keep_best_state:
+                    best_state = {
+                        "X_db": self.X_db.copy(),
+                        "Y_db_by_design": {d: self.Y_db_by_design[d].copy() for d in self.designs},
+                        "log_prior_db": self.log_prior_db.copy(),
+                        "log_prop_db": self.log_prop_db.copy(),
+                    }
+                stagnant_rounds = 0
+            else:
+                stagnant_rounds += 1
+
+            # ----------------------------------------------
+            # stopping
+            stop = False
+            reason = "continue"
+
+            if it + 1 >= min_iter and stagnant_rounds >= patience:
+                stop = True
+                reason = "predictive stagnation"
+            elif it == max_iter - 1:
+                stop = True
+                reason = "max_iter"
+
+            self.history.append({
+                "iteration": int(it),
+                "db_size": int(self.X_db.shape[0]),
+                "mean_radius": mean_radius,
+                "max_radius": max_radius,
+                "posterior_mode_weight": float(mode_w),
+                "n_flagged": int(n_flagged),
+                "rel_improvement_radius": float(rel_impr_radius) if not np.isnan(rel_impr_radius) else np.nan,
+                "mode_shift": float(mode_shift) if not np.isnan(mode_shift) else np.nan,
+                "theta_change": float(theta_change) if not np.isnan(theta_change) else np.nan,
+                "predictive_score_W2": float(pred_score),
+                "best_predictive_score_so_far_W2": float(best_pred_score),
+                "best_iter_so_far": int(best_iter) if best_iter is not None else -1,
+                "truth_wasserstein": Wasser_Distance,
+                "stop": bool(stop),
+                "stop_reason": reason,
+            })
+
+            if verbose:
+                msg = (
+                    f"[iter {it + 1}/{max_iter}] "
+                    f"db={self.X_db.shape[0]} "
+                    f"pred_W2={pred_score:.4g} "
+                    f"mean_radius={mean_radius:.4g} "
+                    f"max_radius={max_radius:.4g} "
+                    f"flagged={n_flagged}"
+                )
+                if Wasser_Distance is not None:
+                    msg += f" truth_W={Wasser_Distance:.4g}"
+                print(msg)
+            if stop:
+                break
+
+            # ----------------------------------------------
+            # simple enrichment from the worst ball
+            if sampler_mcmcm:
+                X_new, logq_new, mcmc_info = self.sample_mcmc_from_flagged(
+                    n_chains=5,
+                    steps_per_chain=60,
+                    burnin=20,
+                    top_frac=top_frac,
+                    proposal_scale=0.5,
+                    inflate=inflate,
+                    start_mode="mean",
+                    keep_every=5,
+                    return_all_samples=False,
+                )
+
+                if verbose:
+                    print(
+                        f"   MCMC enrich -> n_new={X_new.shape[0]} "
+                        f"mean_acc={mcmc_info['mean_acceptance']:.3f}"
+                    )
+            else:
+                sample_out = self.sample_from_worst_ball(
+                    n_per_center=n_new_per_iter,
+                    inflate=inflate,
+                )
+                # support both signatures:
+                #   (X_new, logq_new)
+                #   (X_new, logq_new, worst_local_id)
+                if len(sample_out) == 2:
+                    X_new, logq_new = sample_out
+                else:
+                    X_new, logq_new, _ = sample_out
+
+            self.append_to_archive(X_new, logq_new)
+
+            prev_mean_radius = mean_radius
+            prev_mode = mode_x.copy()
+            prev_Xi = Xi.copy()
+
+        # ----------------------------------------------
+        # restore best predictive state if requested
+        if keep_best_state and best_state is not None:
+            self.X_db = best_state["X_db"]
+            self.Y_db_by_design = best_state["Y_db_by_design"]
+            self.log_prior_db = best_state["log_prior_db"]
+            self.log_prop_db = best_state["log_prop_db"]
+
+        # final refresh
+        self.fit_local_models()
+        self.compute_posterior_weights(inflate=1.0)
+
+        return pd.DataFrame(self.history), self.diagnostics()

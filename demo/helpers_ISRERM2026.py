@@ -13,7 +13,7 @@ def posterior_mode_from_db_multidesign(solver):
     return solver.posterior_mode_from_db()
 
 
-def plot_posterior_vs_true_theta_case1(  solver,  Demp,   xlim=(-15, 15),  ylim=(-15, 15),  gridsize=120,  n_levels=12, ):
+def plot_posterior_vs_true_theta_case1(solver,  Demp,   xlim=(-15, 15),  ylim=(-15, 15),  gridsize=120,  n_levels=12, ):
     xx = np.linspace(xlim[0], xlim[1], gridsize)
     yy = np.linspace(ylim[0], ylim[1], gridsize)
     X1, X2 = np.meshgrid(xx, yy)
@@ -292,6 +292,7 @@ def plot_airmode_posterior_style(
         n2plt=10_000,
         n_post=10_000,
         design="AIRMODE",
+        plot_sim=True,
         random_state=123,
 ):
     X_sim = np.asarray(solver.X_db, dtype=float)
@@ -310,7 +311,9 @@ def plot_airmode_posterior_style(
 
     for pairs, axi in zip(pairs_2_plt, axs):
         i, j = pairs
-        axi.scatter(X_sim[:n2plt, i], X_sim[:n2plt, j], 10, c="b", alpha=0.25, label="sim")
+
+        if plot_sim:
+            axi.scatter(X_sim[:n2plt, i], X_sim[:n2plt, j], 10, c="b", alpha=0.25, label="sim")
         axi.scatter(X_post[:n2plt, i], X_post[:n2plt, j], 4, c="k", alpha=0.20, label="posterior")
         axi.scatter(theta_tmcmc[:n2plt, i], theta_tmcmc[:n2plt, j], 6, c="r", marker="+", label="TMCMC ref")
         axi.set_xlabel(theta_latex_names[i])
@@ -326,7 +329,8 @@ def plot_airmode_posterior_style(
 
     for pairs, axi in zip(pairs_2_plt, axs):
         i, j = pairs
-        axi.scatter(Y_sim[:n2plt, i], Y_sim[:n2plt, j], 10, c="b", alpha=0.25, label="sim")
+        if plot_sim:
+            axi.scatter(Y_sim[:n2plt, i], Y_sim[:n2plt, j], 10, c="b", alpha=0.25, label="sim")
         axi.scatter(Y_post[:n2plt, i], Y_post[:n2plt, j], 4, c="k", alpha=0.20, label="posterior predictive")
         axi.scatter(Y_emp[:, i], Y_emp[:, j], 10, c="r", marker="+", label="emp")
         axi.set_xlabel(Y_latex_names[i])
@@ -419,3 +423,368 @@ def prepare_airmode_for_calibration(Nemp=20, Nsim=5000):
     d_x = X_sim.shape[1]
     prior = multivariate_normal(mean=np.zeros(d_x), cov=np.eye(d_x))
     return model_design, Y_emp_by_design, sim_db, prior
+
+
+def _add_density_contours(ax, X, color, levels=4, linewidths=1.4, alpha=0.9, zorder=3):
+    """
+    Add 2D KDE contours to an axis.
+    X must be (n, 2).
+    """
+    X = np.asarray(X, dtype=float)
+    if X.shape[0] < 20:
+        return
+
+    xmin, ymin = X.min(axis=0)
+    xmax, ymax = X.max(axis=0)
+
+    # small padding
+    dx = xmax - xmin
+    dy = ymax - ymin
+    xmin -= 0.08 * max(dx, 1e-8)
+    xmax += 0.08 * max(dx, 1e-8)
+    ymin -= 0.08 * max(dy, 1e-8)
+    ymax += 0.08 * max(dy, 1e-8)
+
+    xx, yy = np.meshgrid(
+        np.linspace(xmin, xmax, 120),
+        np.linspace(ymin, ymax, 120)
+    )
+    grid = np.vstack([xx.ravel(), yy.ravel()])
+
+    try:
+        kde = gaussian_kde(X.T)
+        zz = kde(grid).reshape(xx.shape)
+
+        # use quantile-like contour levels
+        zmax = zz.max()
+        if zmax <= 0:
+            return
+        levs = np.linspace(0.25, 0.85, levels) * zmax
+
+        ax.contour(
+            xx, yy, zz,
+            levels=levs,
+            colors=color,
+            linewidths=linewidths,
+            alpha=alpha,
+            zorder=zorder,
+        )
+    except Exception:
+        pass
+
+
+def _style_axis(ax):
+    ax.set_facecolor("#fafafa")
+    ax.grid(True, color="#d9d9d9", linewidth=0.7, alpha=0.6)
+    for spine in ax.spines.values():
+        spine.set_color("#bfbfbf")
+        spine.set_linewidth(0.8)
+
+
+def _panel_label(ax, txt):
+    ax.text(
+        0.02, 0.98, txt,
+        transform=ax.transAxes,
+        ha="left", va="top",
+        fontsize=11, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#bbbbbb", alpha=0.9)
+    )
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+
+
+def add_cov_ellipse(ax, X, n_std=2.0, edgecolor="#1d4ed8", label=None):
+    X = np.asarray(X, dtype=float)
+    mu = X.mean(axis=0)
+    cov = np.cov(X[:, 0], X[:, 1])
+
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals = vals[order]
+    vecs = vecs[:, order]
+
+    angle = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    width, height = 2 * n_std * np.sqrt(vals)
+
+    ell = Ellipse(
+        xy=mu,
+        width=width,
+        height=height,
+        angle=angle,
+        fill=False,
+        lw=2.0,
+        ls="-",
+        edgecolor=edgecolor,
+        alpha=0.9,
+        label=label,
+        zorder=5,
+    )
+    ax.add_patch(ell)
+
+
+def plot_posterior_vs_target_2d_fancy(
+        X_post,
+        theta_true,
+        xlim=None,
+        ylim=None,
+        xlabel=r"$\theta_1$",
+        ylabel=r"$\theta_2$",
+        title="Posterior vs target",
+):
+    X_post = np.asarray(X_post, dtype=float)
+    theta_true = np.asarray(theta_true, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.0))
+    ax.set_facecolor("#f8fafc")
+
+    # posterior samples
+    ax.scatter(
+        X_post[:, 0],
+        X_post[:, 1],
+        s=16,
+        c="#2563eb",
+        alpha=0.20,
+        linewidths=0,
+        label="posterior",
+        zorder=2,
+    )
+
+    # target
+    ax.scatter(
+        theta_true[:, 0],
+        theta_true[:, 1],
+        s=40,
+        c="#dc2626",
+        marker="+",
+        alpha=0.75,
+        linewidths=1.4,
+        label="target",
+        zorder=4,
+    )
+
+    # posterior mean
+    mu = X_post.mean(axis=0)
+    ax.scatter(
+        mu[0], mu[1],
+        s=110,
+        c="#1e3a8a",
+        marker="X",
+        edgecolors="white",
+        linewidths=1.0,
+        label="posterior mean",
+        zorder=6,
+    )
+
+    # covariance ellipse
+    add_cov_ellipse(ax, X_post, n_std=2.0, edgecolor="#1e40af", label=r"posterior $2\sigma$ ellipse")
+
+    ax.set_title(title, fontsize=13, pad=12)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+
+    ax.grid(True, linestyle="--", alpha=0.28)
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    leg = ax.legend(frameon=True, loc="best")
+    leg.get_frame().set_alpha(0.95)
+
+    for spine in ax.spines.values():
+        spine.set_alpha(0.35)
+
+    plt.tight_layout()
+    plt.show()
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from scipy.stats import gaussian_kde
+def plot_airmode_comparison_fancy(
+        solver,
+        theta_tmcmc,
+        design="AIRMODE",
+        plot_sim=False,
+        n2plt=1000,
+        pairs_theta=((1, 5), (3, 2), (5, 3), (1, 9)),
+        pairs_y=((1, 5), (3, 2), (5, 3), (1, 9)),
+        theta_latex_names=None,
+        Y_latex_names=None,
+        posterior_label="Posterior",
+        ref_label="TMCMC reference",
+        predictive_label="Posterior predictive",
+        empirical_label="Empirical",
+        sim_label="Archive"
+):
+    # ------------------------------------------------------------
+    # labels
+    if theta_latex_names is None:
+        theta_latex_names = [
+            r"$\theta_1$", r"$\theta_2$", r"$\theta_3$",
+            r"$\theta_4$", r"$\theta_5$", r"$\theta_6$",
+            r"$\theta_7$", r"$\theta_8$", r"$\theta_9$",
+            r"$\theta_{10}$", r"$\theta_{11}$"
+        ]
+
+    if Y_latex_names is None:
+        Y_latex_names = [
+            r"$D_1$", r"$D_2$", r"$D_3$", r"$D_4$", r"$D_5$",
+            r"$D_6$", r"$D_7$", r"$D_8$", r"$D_9$", r"$D_{10}$"
+        ]
+
+    # ------------------------------------------------------------
+    # data
+    X_sim = np.asarray(solver.X_db, dtype=float)
+    Y_sim = np.asarray(solver.Y_db_by_design[design], dtype=float)
+    Y_emp = np.asarray(solver.Y_emp_by_design[design], dtype=float)
+
+    X_post = solver.sample_posterior_particles_smooth(n_samples=n2plt)
+    Y_post = np.asarray(solver.model(X_post, design), dtype=float)
+
+    d_cmp = min(X_post.shape[1], theta_tmcmc.shape[1])
+
+    # colors
+    c_post = "#1f1f1f"  # black-ish
+    c_ref = "#d62728"  # red
+    c_emp = "#d62728"
+    c_sim = "#1f77b4"  # blue
+
+    # ------------------------------------------------------------
+    # FIGURE 1: parameter space
+    fig, axs = plt.subplots(int(len(pairs_theta) / 2), 2, figsize=(10, 9))
+    axs = axs.flatten()
+
+    for p, (i, j) in enumerate(pairs_theta):
+        ax = axs[p]
+        _style_axis(ax)
+
+        if i >= d_cmp or j >= d_cmp:
+            ax.axis("off")
+            continue
+
+        # optional archive cloud
+        if plot_sim:
+            ax.scatter(
+                X_sim[:n2plt, i], X_sim[:n2plt, j],
+                s=10, c=c_sim, alpha=0.12, edgecolors="none", zorder=1
+            )
+
+        # posterior samples
+        ax.scatter(
+            X_post[:n2plt, i], X_post[:n2plt, j],
+            s=14, c=c_post, alpha=0.18, edgecolors="none", zorder=2
+        )
+
+        # TMCMC reference
+        ax.scatter(
+            theta_tmcmc[:n2plt, i], theta_tmcmc[:n2plt, j],
+            s=28, c=c_ref, alpha=0.75, marker="+", linewidths=1.0, zorder=4
+        )
+
+        # contours
+        _add_density_contours(ax, X_post[:n2plt][:, [i, j]], color=c_post, levels=4, zorder=3)
+        _add_density_contours(ax, theta_tmcmc[:n2plt][:, [i, j]], color=c_ref, levels=4, zorder=5)
+
+        ax.set_xlabel(theta_latex_names[i], fontsize=11)
+        ax.set_ylabel(theta_latex_names[j], fontsize=11)
+        ax.set_title(f"{theta_latex_names[i]} vs {theta_latex_names[j]}", fontsize=12, pad=8)
+        _panel_label(ax, f"({chr(97 + p)})")
+
+    legend_handles = []
+    if plot_sim:
+        legend_handles.append(
+            Line2D([0], [0], marker='o', linestyle='None', markersize=7,
+                   markerfacecolor=c_sim, markeredgecolor='none', alpha=0.35, label=sim_label)
+        )
+    legend_handles.extend([
+        Line2D([0], [0], marker='o', linestyle='None', markersize=7,
+               markerfacecolor=c_post, markeredgecolor='none', alpha=0.55, label=posterior_label),
+        Line2D([0], [0], marker='+', linestyle='None', markersize=10,
+               color=c_ref, label=ref_label),
+    ])
+
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=len(legend_handles),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.99),
+        fontsize=11
+    )
+    fig.suptitle(
+        "AIRMODE: Posterior parameter samples vs TMCMC reference",
+        fontsize=15, fontweight="bold", y=1.03
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+    # ------------------------------------------------------------
+    # FIGURE 2: response / predictive space
+    fig, axs = plt.subplots(int(len(pairs_theta) / 2), 2, figsize=(10, 9))
+    axs = axs.flatten()
+    for p, (i, j) in enumerate(pairs_y):
+        ax = axs[p]
+        _style_axis(ax)
+
+        if i >= Y_post.shape[1] or j >= Y_post.shape[1]:
+            ax.axis("off")
+            continue
+
+        # optional archive simulated responses
+        if plot_sim:
+            ax.scatter(
+                Y_sim[:n2plt, i], Y_sim[:n2plt, j],
+                s=10, c=c_sim, alpha=0.12, edgecolors="none", zorder=1
+            )
+
+        # posterior predictive
+        ax.scatter(
+            Y_post[:n2plt, i], Y_post[:n2plt, j],
+            s=14, c=c_post, alpha=0.18, edgecolors="none", zorder=2
+        )
+
+        # empirical data
+        ax.scatter(
+            Y_emp[:, i], Y_emp[:, j],
+            s=34, c=c_emp, alpha=0.85, marker="+", linewidths=1.2, zorder=4
+        )
+
+        # contours only for predictive cloud
+        _add_density_contours(ax, Y_post[:n2plt][:, [i, j]], color=c_post, levels=4, zorder=3)
+
+        ax.set_xlabel(Y_latex_names[i], fontsize=11)
+        ax.set_ylabel(Y_latex_names[j], fontsize=11)
+        ax.set_title(f"{Y_latex_names[i]} vs {Y_latex_names[j]}", fontsize=12, pad=8)
+        _panel_label(ax, f"({chr(97 + p)})")
+
+    legend_handles = []
+    if plot_sim:
+        legend_handles.append(
+            Line2D([0], [0], marker='o', linestyle='None', markersize=7,
+                   markerfacecolor=c_sim, markeredgecolor='none', alpha=0.35, label=sim_label)
+        )
+    legend_handles.extend([
+        Line2D([0], [0], marker='o', linestyle='None', markersize=7,
+               markerfacecolor=c_post, markeredgecolor='none', alpha=0.55, label=predictive_label),
+        Line2D([0], [0], marker='+', linestyle='None', markersize=10,
+               color=c_emp, label=empirical_label),
+    ])
+
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=len(legend_handles),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.99),
+        fontsize=11
+    )
+    fig.suptitle(
+        "AIRMODE: Posterior predictive responses vs empirical observations",
+        fontsize=15, fontweight="bold", y=1.03
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()

@@ -6,13 +6,28 @@ import joblib
 from resources.AIRMODE.load_helpers import load_mat_auto
 
 
-def prepare_case(case_id, Nemp=20, Nsim=1_000):
+def prepare_case(case_id, Nemp=20, Nsim=1_000, DGM=3):
 
     if case_id ==1:
-        M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim)
+        """ the paraboloid model with 3 data types"""
+        if DGM==2:
+            xi_list = np.array([0.0])
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+        elif DGM==3:
+            xi_list = np.array([-2.0, -1.0, 0.0, .2, 1.3, 2])
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+        else: #DMG-1
+            xi_list = np.array([0.0])
+            Nemp=1
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+
+
     elif case_id == 2:
+        """ the AIRMOD data"""
         M, Demp, Dsim = prepare_case_2_data(Nemp=Nemp, Nsim=Nsim)
+
     elif case_id == 3:
+        """ the energy+ data set"""
         print('to be implemented')
         M, Demp, Dsim = [],[], []
     else:
@@ -21,7 +36,7 @@ def prepare_case(case_id, Nemp=20, Nsim=1_000):
     return M, Demp, Dsim
 
 
-def prepare_case_1_data(Nemp=20, Nsim=1_000, seed=123):
+def prepare_case_1_data(Nemp=20, Nsim=1_000, xi_list = np.array([-2.0, -1.0, 0.0, .2, 1.3, 2]), seed=123):
     """loading model M, empirical data Demp, and simulated archived Dsim for case 1 """
 
     rng = np.random.default_rng(seed)
@@ -35,8 +50,8 @@ def prepare_case_1_data(Nemp=20, Nsim=1_000, seed=123):
     def sample_true_pdf_theta(Nemp):
         # Sample from multivariate Gaussian:
         # mean = [4.2, 3.2]  covariance = [[2.0, -0.7], [-0.7, 3.1]]
-        mean = [4.2, 3.2]
-        cov = [[0.5, -0.7], [-0.7, 0.5]]
+        mean = [2.0, 3.0]
+        cov = [[0.5, 0.0], [0.0, 0.5]]
         return rng.multivariate_normal(mean, cov, size=Nemp)
 
 
@@ -63,7 +78,6 @@ def prepare_case_1_data(Nemp=20, Nsim=1_000, seed=123):
             }
         return data_simulated
 
-    xi_list = np.array([-2.0, -1.0, 0.0, 2.0, 4.0])  # 5 designs
     Model = paraboloid_model
     Demp = generate_empirical_data(Nemp=Nemp, xi_list=xi_list)
     Dsim = generate_simulated_data(Nsim=Nsim, xi_list=xi_list)
