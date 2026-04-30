@@ -6,20 +6,25 @@ import joblib
 from resources.AIRMODE.load_helpers import load_mat_auto
 
 
-def prepare_case(case_id, Nemp=20, Nsim=1_000, DGM=3):
+def prepare_case(case_id, Nemp=20, Nsim=1_000, DGM=3, lb=None, ub =None):
 
     if case_id ==1:
         """ the paraboloid model with 3 data types"""
+
+        if lb is None:
+           lb = -5
+        if ub is None:
+            ub = +5
         if DGM==2:
             xi_list = np.array([0.0])
-            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list, lb=lb, ub=ub)
         elif DGM==3:
             xi_list = np.array([-2.0, -1.0, 0.0, .2, 1.3, 2])
-            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list, lb=lb, ub=ub)
         else: #DMG-1
             xi_list = np.array([0.0])
             Nemp=1
-            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list)
+            M, Demp, Dsim = prepare_case_1_data(Nemp=Nemp, Nsim=Nsim, xi_list=xi_list, lb=lb, ub=ub)
 
 
     elif case_id == 2:
@@ -36,8 +41,12 @@ def prepare_case(case_id, Nemp=20, Nsim=1_000, DGM=3):
     return M, Demp, Dsim
 
 
-def prepare_case_1_data(Nemp=20, Nsim=1_000, xi_list = np.array([-2.0, -1.0, 0.0, .2, 1.3, 2]), seed=123):
+def prepare_case_1_data(Nemp=20, Nsim=1_000, xi_list = np.array([-2.0, -1.0, 0.0, .2, 1.3, 2]), lb=None, ub=None, seed=123):
     """loading model M, empirical data Demp, and simulated archived Dsim for case 1 """
+    if  lb is None:
+        lb=-10
+    if ub is None:
+        ub = +10
 
     rng = np.random.default_rng(seed)
 
@@ -69,7 +78,7 @@ def prepare_case_1_data(Nemp=20, Nsim=1_000, xi_list = np.array([-2.0, -1.0, 0.0
 
     def generate_simulated_data(Nsim, xi_list):
         data_simulated = {}
-        theta = rng.uniform(-5, 5, size=(Nsim, 2))
+        theta = rng.uniform(lb, ub, size=(Nsim, 2))
         for i, xi in enumerate(xi_list):
             y_data = paraboloid_model(theta, xi=xi)
             data_simulated[i] = {"xi": xi,

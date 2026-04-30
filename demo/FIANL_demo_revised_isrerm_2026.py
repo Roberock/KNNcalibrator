@@ -17,7 +17,8 @@ from scipy.stats import multivariate_normal
 from scipy.special import logsumexp
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-from time import time
+
+SAMPLE_WORST_RADIUS = True
 
 class SimpleAdaptiveKNNABC:
     """
@@ -430,7 +431,7 @@ class SimpleAdaptiveKNNABC:
             "spreads": spreads,
         }
 
-    def _component_covs_from_lm(self, lm, k_cov=5, inflate=1.0, ridge_rel=1e-2):
+    def _component_covs_from_lm(self, lm, k_cov=10, inflate=1.0, ridge_rel=1e-2):
         """
         Compute component-specific local covariances for the centers in lm["Xi"].
 
@@ -491,13 +492,13 @@ class SimpleAdaptiveKNNABC:
         for i, j in enumerate(comp_idx):
             X_new[i] = self.rng.multivariate_normal(
                 mean=centers[j],
-                cov=cov_list[j],
+                cov=cov_list[j]*inflate,
             )
 
         log_parts = []
         for wk, mu, cov_j in zip(mix_w, centers, cov_list):
             log_parts.append(
-                np.log(wk + 1e-300) + self._safe_mvn_logpdf(X_new, mu, cov_j)
+                np.log(wk + 1e-300) + self._safe_mvn_logpdf(X_new, mu, cov_j*inflate)
             )
         logq_new = logsumexp(np.column_stack(log_parts), axis=1)
         info = {}
@@ -762,6 +763,7 @@ class SimpleAdaptiveKNNABC:
         keep_best_state=True,
         true_target=None,
         verbose=True,
+        visual_diagnostic=True,
     ):
         """
         Adaptive archive refinement with history keys compatible with the
@@ -903,15 +905,30 @@ class SimpleAdaptiveKNNABC:
             if stop:
                 break
 
-            X_new, logq_new, _  = self.sample_from_worst_ball(
-                n_new=n_new_per_iter,
-                inflate=inflate,
-            )
 
-            """ 
-            X_new, logq_new, _  = self.sample_from_flagged_balls_fast(
-                                                  n_new=n_new_per_iter, inflate=inflate, )
-            """
+            if SAMPLE_WORST_RADIUS:
+
+                X_new, logq_new, _  = self.sample_from_worst_ball(
+                    n_new=n_new_per_iter,
+                    inflate=inflate,
+                )
+            else:
+                X_new, logq_new, _  = self.sample_from_flagged_balls_fast(n_new=n_new_per_iter,
+                                                                          inflate=inflate, )
+
+
+            if visual_diagnostic:
+                plt.scatter(self.X_db[:, 0], self.X_db[:, 1], label='archive', alpha=0.1)
+                plt.scatter(X_new[:, 0], X_new[:, 1], c='k', label='sample from flagged', marker='d', alpha=0.3)
+                for idx_lm, lm in enumerate(self.local_models):
+                    if idx_lm==0:
+                        plt.scatter(lm['Xi'][:, 0],lm['Xi'][:, 1],label='knn ', c='b', alpha=0.6)
+                    else:
+                        plt.scatter(lm['Xi'][:, 0],lm['Xi'][:, 1], c='b', alpha=0.6)
+                plt.scatter(true_target[:, 0], true_target[:, 1], s=20, c='r', label='target', marker='+', alpha=0.9)
+                plt.grid()
+                plt.legend()
+                plt.show()
 
             self.append_to_archive(X_new, logq_new)
 
@@ -940,32 +957,29 @@ class SimpleAdaptiveKNNABC:
 # LOAD THE NEW CLASS AS SOLVER
 SOLVER = SimpleAdaptiveKNNABC
 
-
 # SOLVER CONFIG
-top_frac = 0.3
-n_new_per_iter= 50
-posterior_cov_scale=0.05
-
+top_frac = 0.5
+n_new_per_iter= 500
+posterior_cov_scale=0.01
 ridge, seed = 1e-2, 123
-min_iter, max_iter = 5, 30
+min_iter, max_iter = 5, 100
 inflate = 0.95
-improve_tol = 0.01
+improve_tol = 0.001
 patience = 4
 n_post_pred = 100
-
 Number_of_KNN = 100
-Nemp= 50
-Nsim = 1_000
-
+Nemp= 200
+Nemp_airmode = 500
+Nsim = 500
+Nsim_airmode = 5_000
 xlim = [-10,  10]
 ylim = [-10,  10]
-
+visual_diagnostic  = True
 
 def run_case_1_paraboloid(DGM=3):
     # -------------------- Problem 1 - paraboloid inverse problem
     _, Demp, _ = prepare_case(1, Nemp=10_000, Nsim=2, DGM=DGM)
     Theta_target = [D["theta"] for _, D in Demp.items()]
-    # Y_target = [D["y_data"] for _, D in Demp.items()]
 
     M, Demp, Dsim = prepare_case(1, Nemp=Nemp, Nsim=Nsim, DGM=DGM)
     M_design, Y_emp_by_design, sim_db = adapt_case1_for_multidesign(M, Demp, Dsim)
@@ -997,29 +1011,32 @@ def run_case_1_paraboloid(DGM=3):
         keep_best_state=True,
         true_target=Theta_target[0],   # works for case 1
         verbose=True,
+        visual_diagnostic=visual_diagnostic,
     )
 
     # ------------------------------------------------------------
     # posterior samples
     X_post = solver.sample_posterior_particles_smooth( n_samples=2000)
-
     theta_true = np.asarray(Theta_target[0], dtype=float)
     if theta_true.ndim == 1:
         theta_true = theta_true.reshape(1, -1)
 
-    plt.figure(figsize=(6, 5))
-    plt.scatter(theta_true[:, 0], theta_true[:, 1], color="r", marker="+", s=60, alpha=0.5, label="target")
-
-    plt.scatter(X_post[:, 0], X_post[:, 1], color="b", s=10, alpha=0.30, label="posterior")
-    plt.grid(True)
-    plt.xlim(xlim)
-    plt.ylim(ylim)
-    plt.ylabel(r"$\theta_2$")
-    plt.xlabel(r"$\theta_1$")
-    plt.legend()
-    plt.tight_layout()
+    plot_posterior_with_marginals(
+        X_post,
+        theta_true=theta_true,
+        xlim=xlim,
+        ylim=ylim,
+        figsize=(7, 7),
+        n_grid_1d=300,
+        n_grid_2d=100,
+        scatter_alpha=0.70,
+        scatter_size=20,
+        contour_levels=4,
+        filled_levels=15,
+        show_filled=True,
+        show_contours=True,
+        )
     plt.show()
-
 
     print("🎬 Generating posterior progression plot...")
     print("\n🎯 SUMMARY:")
@@ -1034,22 +1051,13 @@ def run_case_1_paraboloid(DGM=3):
     print(f"• Final posterior mode: {mode_x}")
     print(f"• Final posterior mode weight: {mode_w:.4g}")
 
-    # Optional plotting helpers if you still want them
-    # plot_posterior_vs_true_theta_case1(solver, Demp)
-    # plot_posterior_predictive_vs_empirical(solver, n_post_samples=3000)
-    # plot_empirical_vs_posterior_intervals(solver, n_post_samples=3000)
-    # solver.fit_local_models()
-    # plot_posterior_x_by_design_case1(solver, Demp, n_post_samples=3000)
-    # plot_posterior_vs_true_theta_by_design_case1(solver, Demp)
-
-
 def run_case_2_airmod():
     # ------------------------------------------------------------
     # AIRMODE calibration workflow
     model_airmode, Y_emp_by_design, sim_db, prior = prepare_airmode_for_calibration(
-                    Nemp=Nemp,
-                    Nsim=Nsim,
-                )
+                                                    Nemp=Nemp_airmode,
+                                                    Nsim=Nsim_airmode,
+                                                )
 
     # ---------- Paths, Load, Extract TMCMC ----------
     ref_tmcmc_data_path = "../resources/AIRMODE/data/reference_TMCMC_DLRAirmod.mat"
@@ -1082,9 +1090,21 @@ def run_case_2_airmod():
         n_post_pred=n_post_pred,
         posterior_cov_scale=posterior_cov_scale,
         keep_best_state=True,
-        true_target=None,
+        true_target=theta_tmcmc[:,:10],
         verbose=True,
+        visual_diagnostic=visual_diagnostic
     )
+
+    X_post =solver.sample_posterior_particles_smooth(n_samples=5_000)
+
+    df_my_samples = pd.DataFrame(X_post, columns=[
+        "theta1", "theta2", "theta3", "theta4", "theta5", "theta6",
+        "theta7", "theta8", "theta9", "theta10", "theta11", "theta12" ])
+
+    plot_airmode_reference_overlay(
+                        my_samples=df_my_samples,
+                        my_label="ABC-KDE-KNN posterior",
+                        my_color="royalblue"  )
 
     print("\nAIRMODE SUMMARY")
     print(f"Initial mean radius: {hist['mean_radius'].iloc[0]:.4f}")
@@ -1095,24 +1115,27 @@ def run_case_2_airmod():
     db_size_initial = sim_db["X"].shape[0]
     db_size_final = solver.X_db.shape[0]
     print(f"Database size:       {db_size_initial} -> {db_size_final}")
-
+    print(f"X_post median:         {np.quantile(X_post,0.5, axis=0)}")
+    print(f"X_post std:         {np.std(X_post, axis=0)}")
     # plotting
+    pairs_2_plt = ((4, 5), (9, 10), (6, 7), (6, 8), (1, 11))
     plot_airmode_comparison_fancy(
         solver=solver,
         theta_tmcmc=theta_tmcmc,
         design="AIRMODE",
         plot_sim=False,
         n2plt=2000,
-        pairs_theta=((1, 2), (1, 3), (2, 3), (3, 4), (2, 5), (3, 9)),
+        pairs_theta=pairs_2_plt,
         pairs_y=((1, 2), (1, 3), (2, 3), (3, 4), (2, 5), (3, 9)),
     )
 
 
 def run_EXP_ISRERM2026():
+    run_case_2_airmod()
+
     run_case_1_paraboloid(DGM=1)
     run_case_1_paraboloid(DGM=2)
     run_case_1_paraboloid(DGM=3)
-    run_case_2_airmod()
 
 
 
