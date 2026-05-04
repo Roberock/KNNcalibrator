@@ -182,9 +182,12 @@ class SimpleAdaptiveKNNABC:
                 di = distances[i]
 
                 eps_i = float(np.max(di) + 1e-12)
-                log_import = self.log_prior_db[idx] - self.log_prop_db[idx]
 
-                logw = -0.5 * (di / eps_i) ** 2 + log_import
+                #todo: try removing weighting
+                #log_import = self.log_prior_db[idx] - self.log_prop_db[idx]
+                #logw = -0.5 * (di / eps_i) ** 2 + log_import
+
+                logw = -0.5 * (di / eps_i) ** 2
                 logw -= logsumexp(logw)
                 w = np.exp(logw)
 
@@ -929,6 +932,20 @@ class SimpleAdaptiveKNNABC:
                 plt.grid()
                 plt.legend()
                 plt.show()
+                try:
+                    X_posterior = self.sample_posterior_particles_smooth(n_samples=5_000)
+
+                    df_my_samples = pd.DataFrame(X_posterior, columns=[
+                        "theta1", "theta2", "theta3", "theta4", "theta5", "theta6",
+                        "theta7", "theta8", "theta9", "theta10", "theta11", "theta12"])
+
+                    plot_airmode_reference_overlay(my_samples=df_my_samples,
+                                                   my_label="ABC-KDE-KNN posterior",
+                                                   my_color="royalblue")
+                except:
+                    print('failed to run 2nd plot')
+
+
 
             self.append_to_archive(X_new, logq_new)
 
@@ -959,7 +976,7 @@ SOLVER = SimpleAdaptiveKNNABC
 
 # SOLVER CONFIG
 top_frac = 0.5
-n_new_per_iter= 500
+n_new_per_iter= 50
 posterior_cov_scale=0.01
 ridge, seed = 1e-2, 123
 min_iter, max_iter = 5, 100
@@ -969,23 +986,24 @@ patience = 4
 n_post_pred = 100
 Number_of_KNN = 100
 Nemp= 200
-Nemp_airmode = 500
-Nsim = 500
-Nsim_airmode = 5_000
+Nemp_airmode = 1_000
+Nsim = 5_000
+Nsim_airmode = 20_000
 xlim = [-10,  10]
 ylim = [-10,  10]
-visual_diagnostic  = True
+lb= [xlim[0], ylim[0]]
+ub = [xlim[1], ylim[1]]
+visual_diagnostic  = False
 
 def run_case_1_paraboloid(DGM=3):
     # -------------------- Problem 1 - paraboloid inverse problem
-    _, Demp, _ = prepare_case(1, Nemp=10_000, Nsim=2, DGM=DGM)
+    _, Demp, _ = prepare_case(1, Nemp=10_000, Nsim=2, DGM=DGM, lb=lb, ub =ub)
     Theta_target = [D["theta"] for _, D in Demp.items()]
 
-    M, Demp, Dsim = prepare_case(1, Nemp=Nemp, Nsim=Nsim, DGM=DGM)
+    M, Demp, Dsim = prepare_case(1, Nemp=Nemp, Nsim=Nsim, DGM=DGM, lb=lb, ub =ub)
     M_design, Y_emp_by_design, sim_db = adapt_case1_for_multidesign(M, Demp, Dsim)
 
-    prior = UniformBoxPrior(low=[xlim[0], ylim[0]],
-                            high=[xlim[1], ylim[1]])
+    prior = UniformBoxPrior(low=lb,  high=ub)
 
     solver = SOLVER(
         model=M_design,
@@ -1101,10 +1119,10 @@ def run_case_2_airmod():
         "theta1", "theta2", "theta3", "theta4", "theta5", "theta6",
         "theta7", "theta8", "theta9", "theta10", "theta11", "theta12" ])
 
-    plot_airmode_reference_overlay(
-                        my_samples=df_my_samples,
-                        my_label="ABC-KDE-KNN posterior",
-                        my_color="royalblue"  )
+    plot_airmode_reference_overlay( my_samples=df_my_samples,
+                                    my_label="ABC-KDE-KNN posterior",
+                                    my_color="royalblue"
+                                    )
 
     print("\nAIRMODE SUMMARY")
     print(f"Initial mean radius: {hist['mean_radius'].iloc[0]:.4f}")
@@ -1131,6 +1149,7 @@ def run_case_2_airmod():
 
 
 def run_EXP_ISRERM2026():
+
     run_case_2_airmod()
 
     run_case_1_paraboloid(DGM=1)
